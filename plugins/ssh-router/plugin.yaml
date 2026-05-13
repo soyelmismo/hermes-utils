@@ -1,0 +1,6 @@
+name: ssh-router
+kind: backend
+description: "Dynamic SSH routing — switch terminal/file backend between local and remote targets at runtime. Use connect_to(device=...), disconnect(), ssh_status()."
+version: 1.0.0
+author: Hermeona (soyelmismo's agent)
+repository: https://github.com/soyelmismo/hermes-utils

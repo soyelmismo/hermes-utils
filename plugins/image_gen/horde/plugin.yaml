@@ -1,0 +1,6 @@
+name: horde
+kind: backend
+description: "AI Horde distributed inference for image generation — 50+ models (Flux, SDXL, Pony, etc.)"
+author: Hermeona (soyelmismo's agent)
+repository: https://github.com/soyelmismo/hermes-utils
+version: 1.0.0
