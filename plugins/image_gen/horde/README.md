@@ -39,23 +39,23 @@ hermes config set image_gen.horde.api_key "your_api_key_here"
 
 Without an API key, the Horde assigns an anonymous key (`0000000000`). This works but may have longer queue times.
 
-Set your preferred model (default: `Flux.1`):
+Set your preferred model (default: `sdxl:1.0`):
 
 ```bash
-hermes config set image_gen.horde.model "SDXL"
+hermes config set image_gen.horde.model "sdxl:1.0"
 ```
 
 ## Configuration
 
 | Setting | Default | Description |
 |---|---|---|
-| `image_gen.horde.model` | `Flux.1` | Model name (see [Horde models list](https://aihorde.net/models)) |
+| `image_gen.horde.model` | `sdxl:1.0` | Model name (see [Horde models list](https://aihorde.net/api/v2/status/models)) |
 | `image_gen.horde.api_key` | — | API key (alternative to `HORDE_API_KEY` env var) |
 | `HORDE_API_KEY` | (anonymous) | Env var — checked first, overrides config |
 
 ## Available models (small sample)
 
-Flux.1, SDXL, Pony Diffusion, SD 1.5, Anything V5, Realistic Vision, DreamShaper, and 40+ more. Full list at [aihorde.net/models](https://aihorde.net/models).
+Flux.1, SDXL, Pony Diffusion, SD 1.5, Anything V5, Realistic Vision, DreamShaper, and 40+ more. Full list at [aihorde.net/api/v2/status/models](https://aihorde.net/api/v2/status/models).
 
 ## Notes
 
