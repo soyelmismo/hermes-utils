@@ -179,15 +179,15 @@ PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
     },
     "width": {
         "type": "int",
-        "default": 1024,
+        "default": 768,
         "min": 64,
         "max": 2048,
-        "description": "Image width. Must be multiple of 64.",
+        "description": "Image width. Must be multiple of 64. If not specified, aspect ratio defaults apply (landscape=1152x768, square=768x768, portrait=768x1152).",
         "category": "basic",
     },
     "height": {
         "type": "int",
-        "default": 1024,
+        "default": 768,
         "min": 64,
         "max": 2048,
         "description": "Image height. Must be multiple of 64.",
@@ -223,9 +223,9 @@ PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 ASPECT_SIZES = {
-    "landscape": (1344, 768),
-    "square": (1024, 1024),
-    "portrait": (768, 1344),
+    "landscape": (1152, 768),
+    "square": (768, 768),
+    "portrait": (768, 1152),
 }
 
 
