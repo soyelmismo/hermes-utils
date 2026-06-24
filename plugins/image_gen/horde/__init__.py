@@ -177,20 +177,12 @@ PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Sampling method.",
         "category": "advanced",
     },
-    "width": {
+    "base_resolution": {
         "type": "int",
         "default": 768,
         "min": 64,
         "max": 2048,
-        "description": "Image width. Must be multiple of 64. If not specified, aspect ratio defaults apply (landscape=1152x768, square=768x768, portrait=768x1152).",
-        "category": "basic",
-    },
-    "height": {
-        "type": "int",
-        "default": 768,
-        "min": 64,
-        "max": 2048,
-        "description": "Image height. Must be multiple of 64.",
+        "description": "Base resolution (long side, en ancho). Final size = base x (height from aspect ratio), redondeada hacia abajo a múltiplo de 64.",
         "category": "basic",
     },
     "seed": {
@@ -222,10 +214,10 @@ PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
     },
 }
 
-ASPECT_SIZES = {
-    "landscape": (1152, 768),
-    "square": (768, 768),
-    "portrait": (768, 1152),
+ASPECT_RATIOS = {
+    "landscape": (16, 9),   # 16:9 (ancho dominante)
+    "square": (1, 1),        # 1:1
+    "portrait": (2, 3),      # 2:3 (alto dominante, portrait vertical)
 }
 
 
@@ -234,13 +226,28 @@ def _nearest_multiple(value: int, multiple: int = 64) -> int:
     return max(64, round(value / multiple) * multiple)
 
 
-def _resolve_size(width: Optional[int], height: Optional[int], aspect: str) -> Tuple[int, int]:
-    """Resolve final dimensions from explicit values or aspect ratio."""
-    if width and height:
-        return _nearest_multiple(width), _nearest_multiple(height)
-    default_w, default_h = ASPECT_SIZES.get(aspect, ASPECT_SIZES["square"])
-    return default_w, default_h
+def _resolve_size(base_resolution: Optional[int], aspect: str) -> Tuple[int, int]:
+    """Resolve final dimensions from a base resolution (long side) and aspect ratio.
 
+    base_resolution is the LONGEST side the user wants. The short side is derived
+    from the aspect ratio and rounded DOWN to the nearest multiple of 64.
+    """
+    base = int(base_resolution) if base_resolution else 768
+    base = _nearest_multiple(max(64, base))
+    ratio_w, ratio_h = ASPECT_RATIOS.get(aspect, ASPECT_RATIOS["square"])
+    if ratio_w >= ratio_h:
+        # landscape/square: width is the long side (base), height is short
+        short = int(base * ratio_h / ratio_w)
+        short = (short // 64) * 64
+        if short < 64:
+            short = 64
+        return base, short
+    # portrait: height is the long side (base), width is short
+    short = int(base * ratio_w / ratio_h)
+    short = (short // 64) * 64
+    if short < 64:
+        short = 64
+    return short, base
 
 # ---------------------------------------------------------------------------
 # Horde API client — per-request sessions (thread-safe)
@@ -435,12 +442,11 @@ class HordeImageGenProvider(ImageGenProvider):
         p.setdefault("steps", cfg_defaults.get("default_steps", 25))
         p.setdefault("cfg_scale", cfg_defaults.get("default_cfg_scale", 7.0))
         p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_euler_a"))
-        p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
+        p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 768))
 
         model_id = p.get("model", DEFAULT_MODEL)
         aspect = resolve_aspect_ratio(p.get("aspect_ratio"))
-        width = p.get("width")
-        height = p.get("height")
+        base_resolution = p.get("base_resolution")
         steps = p.get("steps", 25)
         cfg = p.get("cfg_scale", 7.0)
         sampler = p.get("sampler", "k_euler_a")
@@ -450,15 +456,13 @@ class HordeImageGenProvider(ImageGenProvider):
         # Resolve model name for Horde API
         model_meta = MODELS.get(model_id)
         if not model_meta:
-            # Try as direct horde model name
             horde_model = model_id
             model_display = model_id
         else:
             horde_model = model_meta["horde_name"]
             model_display = model_meta["display"]
 
-        # Resolve dimensions
-        final_w, final_h = _resolve_size(width, height, aspect)
+        final_w, final_h = _resolve_size(base_resolution, aspect)
 
         # Build Horde params
         horde_params: Dict[str, Any] = {
