@@ -53,6 +53,20 @@ hermes config set image_gen.horde.model "sdxl:1.0"
 | `image_gen.horde.api_key` | — | API key (alternative to `HORDE_API_KEY` env var) |
 | `HORDE_API_KEY` | (anonymous) | Env var — checked first, overrides config |
 
+## Censorship handling
+
+AI Horde workers can refuse to return a generated image when their post-generation NSFW detector trips. The worker signals this in the response by setting `state: "censored"` on the generation object (and replaces the image with a censored PNG).
+
+This plugin detects that and **retries automatically**:
+
+- On `state: "censored"` → the same request is re-submitted to the Horde. A different worker in the pool will likely not have the same filter active.
+- On `state: "csam"` (child-safety) → the request is **aborted immediately**. This is non-retryable.
+- After **3 consecutive censored responses** with no clean one, the plugin returns an error with the list of workers that censored.
+
+The user's `model` choice is **always preserved** — retries use the same model, just land on a different worker.
+
+Tune `MAX_CENSORED_RETRIES` in `__init__.py` if you need a different ceiling.
+
 ## Available models (small sample)
 
 Flux.1, SDXL, Pony Diffusion, SD 1.5, Anything V5, Realistic Vision, DreamShaper, and 40+ more. Full list at [aihorde.net/api/v2/status/models](https://aihorde.net/api/v2/status/models).

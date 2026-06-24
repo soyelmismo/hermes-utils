@@ -45,6 +45,10 @@ HORDE_API_URL = "https://aihorde.net/api/v2"
 DEFAULT_TIMEOUT = 300  # 5min max wait for generation
 POLL_INTERVAL = 5      # seconds between status checks
 REQUEST_TIMEOUT = 60   # http request timeout
+# Worker-side NSFW censorship: the worker adds state="censored" to the generation
+# when its post-gen NSFW detector trips. We re-submit the same request (different
+# worker pool) up to this many times before giving up.
+MAX_CENSORED_RETRIES = 3
 
 # ---------------------------------------------------------------------------
 # Model catalog  — curated subset of popular Horde models
@@ -477,7 +481,12 @@ class HordeImageGenProvider(ImageGenProvider):
                 pp = [pp]
             horde_params["post_processing"] = pp
 
-        # Root-level params
+        # Root-level params per the AI Horde v2 API spec (swagger.json).
+        # Note: an unrelated "use_nsfw_censor" flag appears in the worker's
+        # internal source, but it is NOT part of the public client-side
+        # payload — sending it is a no-op. The actual control fields are:
+        #   - nsfw: bool   — accept NSFW workers/content
+        #   - censor_nsfw: bool — request the worker NOT censor (worker chooses)
         root: Dict[str, Any] = {
             "nsfw": p.get("nsfw", True),
             "censor_nsfw": p.get("censor_nsfw", False),
@@ -609,8 +618,177 @@ class HordeImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                 )
 
-            # 4. Download the first image
+            # 4. Detect worker-side censorship BEFORE downloading the (censored) image.
+            # Per AI Horde v2 API spec (swagger.json), a generation object can signal
+            # censorship via three fields (priority order):
+            #   1. gen_metadata[] with type="censorship", value="csam" -> child-safety, NEVER retry
+            #   2. gen_metadata[] with type="censorship", value in {"nsfw","censorlist",...} -> NSFW filter, retry
+            #   3. censored: bool (in GenerationStable) -> true means worker replaced image, retry
+            #   4. state: "ok" | "censored" (in Generation, OBSOLETE) -> "censored" means retry
+            #
+            # We check in order 1->2->3->4. gen_metadata is authoritative.
             first_gen = generations[0]
+
+            # Helper: extract censorship info from a generation dict
+            def _censorship_info(gen: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+                """
+                Returns (censorship_type, worker_name) where censorship_type is:
+                  "csam"       -> child-safety, non-retryable
+                  "nsfw"       -> NSFW filter (nsfw, censorlist, baseline_mismatch, etc.)
+                  "unknown"    -> censored=true or state="censored" but no gen_metadata
+                  None         -> clean
+                """
+                # 1. gen_metadata is authoritative
+                for meta in gen.get("gen_metadata", []):
+                    if meta.get("type") == "censorship":
+                        val = meta.get("value")
+                        if val == "csam":
+                            return "csam", gen.get("worker_name")
+                        if val in ("nsfw", "censorlist", "baseline_mismatch", "see_ref"):
+                            return "nsfw", gen.get("worker_name")
+                        # Any other censorship value -> treat as nsfw (retryable)
+                        return "nsfw", gen.get("worker_name")
+                # 2. censored bool (GenerationStable extension)
+                if gen.get("censored") is True:
+                    return "unknown", gen.get("worker_name")
+                # 3. state field (Generation, OBSOLETE)
+                if gen.get("state") == "censored":
+                    return "unknown", gen.get("worker_name")
+                return None, None
+
+            # Check initial generation
+            ctype, cworker = _censorship_info(first_gen)
+            if ctype == "csam":
+                logger.warning(
+                    "Horde generation flagged CSAM by worker %s; aborting (no retry)",
+                    cworker or "?",
+                )
+                return error_response(
+                    error=(
+                        "Generation aborted by worker child-safety filter (gen_metadata=csam). "
+                        "This is non-retryable."
+                    ),
+                    error_type="csam_rejected",
+                    provider="horde",
+                    model=horde_model,
+                    prompt=prompt,
+                )
+
+            censored_attempts: List[str] = []
+            while ctype in ("nsfw", "unknown"):
+                censored_attempts.append(cworker or "?")
+                logger.warning(
+                    "Horde censored by worker %s on model %s (type=%s, attempt %d/%d)",
+                    cworker or "?",
+                    horde_model,
+                    ctype,
+                    len(censored_attempts),
+                    MAX_CENSORED_RETRIES,
+                )
+                if len(censored_attempts) >= MAX_CENSORED_RETRIES:
+                    return error_response(
+                        error=(
+                            f"Generation censored by {len(censored_attempts)} consecutive "
+                            f"workers on model {horde_model}: {censored_attempts}. "
+                            f"No more retries."
+                        ),
+                        error_type="censored_after_retry",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                # Re-submit with the same model — different worker pool
+                retry_resp = await _horde_generate(
+                    session, api_key, prompt, horde_model, horde_params, root_params,
+                )
+                if "error" in retry_resp:
+                    return error_response(
+                        error=f"Horde retry submit failed: {retry_resp['error']}",
+                        error_type="api_error",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                retry_id = retry_resp.get("id")
+                if not retry_id:
+                    return error_response(
+                        error="Horde retry returned no generation ID",
+                        error_type="empty_response",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                # Poll
+                deadline_r = time.monotonic() + DEFAULT_TIMEOUT
+                timed_out = False
+                while time.monotonic() < deadline_r:
+                    chk = await _horde_check(session, api_key, retry_id)
+                    if "error" in chk:
+                        return error_response(
+                            error=f"Horde retry status check error: {chk['error']}",
+                            error_type="api_error",
+                            provider="horde",
+                            model=horde_model,
+                            prompt=prompt,
+                        )
+                    if chk.get("done"):
+                        break
+                    await asyncio.sleep(POLL_INTERVAL)
+                else:
+                    timed_out = True
+                if timed_out:
+                    await _horde_cancel(session, api_key, retry_id)
+                    return error_response(
+                        error=f"Horde retry timed out after {DEFAULT_TIMEOUT}s",
+                        error_type="timeout",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                # Status
+                st = await _horde_status(session, api_key, retry_id)
+                if "error" in st:
+                    return error_response(
+                        error=f"Horde retry result fetch error: {st['error']}",
+                        error_type="api_error",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                rgens = st.get("generations", [])
+                if not rgens:
+                    return error_response(
+                        error="Horde retry returned no images",
+                        error_type="empty_response",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                rfirst = rgens[0]
+                # Re-evaluate censorship on the retry
+                ctype, cworker = _censorship_info(rfirst)
+                if ctype == "csam":
+                    return error_response(
+                        error="Retry aborted by worker child-safety filter (gen_metadata=csam)",
+                        error_type="csam_rejected",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                # If still censored (nsfw/unknown), loop again. Otherwise accept.
+                if ctype in ("nsfw", "unknown"):
+                    first_gen = rfirst
+                    continue
+                # Success on retry
+                first_gen = rfirst
+                logger.info(
+                    "Horde retry succeeded after %d censored attempt(s); new worker=%s",
+                    len(censored_attempts),
+                    rfirst.get("worker_name", "?"),
+                )
+                break
+
+            # 4b. Download the first image
             img_url = first_gen.get("img")
             if not img_url:
                 return error_response(
