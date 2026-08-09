@@ -51,6 +51,11 @@ REQUEST_TIMEOUT = 60   # http request timeout
 MAX_CENSORED_RETRIES = 3
 # Max size for source images (downloaded and sent as base64)
 MAX_SOURCE_IMAGE_SIZE = 1024
+# A worker can return a "done" job with garbage bytes (not a real image).
+# We validate the downloaded bytes and re-submit up to this many times.
+MAX_BROKEN_RETRIES = 2
+# Minimum plausible size for a generated image (PNG/JPEG header + payload)
+MIN_IMAGE_BYTES = 1024
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,7 +235,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_MODEL = "sdxl:1.0"
+DEFAULT_MODEL = "pony:realistic"
 
 # Parameter metadata for the Hermes tools UI
 PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
@@ -442,6 +447,19 @@ async def _download_image(session: aiohttp.ClientSession, url: str) -> Optional[
     except Exception as e:
         logger.error("Download error: %s", e)
         return None
+
+
+def _is_valid_image_bytes(data: Optional[bytes]) -> bool:
+    """Heuristic validation for worker output.
+
+    Rejects responses that are not actually decodable images (e.g. a worker
+    returning a tiny garbage blob). Accepts PNG and JPEG by magic bytes and
+    enforces a minimum size.
+    """
+    if not data or len(data) < MIN_IMAGE_BYTES:
+        return False
+    # PNG magic: \x89PNG\r\n\x1a\n | JPEG magic: \xff\xd8\xff
+    return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +958,105 @@ class HordeImageGenProvider(ImageGenProvider):
                     provider="horde",
                     model=horde_model,
                     prompt=prompt,
+                )
+
+            # 4c. Validate downloaded bytes — a worker may return a "done" job
+            # with garbage (not an image). Re-submit to a different worker up to
+            # MAX_BROKEN_RETRIES times before giving up.
+            broken_attempts: List[str] = []
+            while not _is_valid_image_bytes(image_bytes):
+                broken_attempts.append(first_gen.get("worker_name", "?"))
+                logger.warning(
+                    "Horde worker %s returned invalid image bytes (%d B, attempt %d/%d); re-submitting",
+                    broken_attempts[-1],
+                    len(image_bytes or b""),
+                    len(broken_attempts),
+                    MAX_BROKEN_RETRIES,
+                )
+                if len(broken_attempts) >= MAX_BROKEN_RETRIES:
+                    return error_response(
+                        error=(
+                            f"Generation returned invalid image data {len(broken_attempts)} "
+                            f"consecutive times ({broken_attempts}); giving up."
+                        ),
+                        error_type="bad_worker_output",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                # Re-submit same request, Horde routes to a different worker.
+                # Blacklist the broken worker so Horde cannot pick it again.
+                broken_worker = first_gen.get("worker_name") or broken_attempts[-1]
+                blacklist = list(horde_params.get("worker_blacklist", []))
+                if broken_worker not in blacklist:
+                    blacklist.append(broken_worker)
+                retry_params = {**horde_params, "worker_blacklist": blacklist}
+                retry_resp = await _horde_generate(
+                    session, api_key, prompt, horde_model, retry_params, root_params
+                )
+                if "error" in retry_resp or "id" not in retry_resp:
+                    return error_response(
+                        error=f"Horde re-submit after bad worker failed: {retry_resp.get('error', retry_resp)}",
+                        error_type="api_error",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                retry_id = retry_resp["id"]
+                # Poll until done
+                deadline_r = time.monotonic() + DEFAULT_TIMEOUT
+                done_r = False
+                while time.monotonic() < deadline_r:
+                    chk = await _horde_check(session, api_key, retry_id)
+                    if "error" in chk:
+                        break
+                    if chk.get("done"):
+                        done_r = True
+                        break
+                    await asyncio.sleep(POLL_INTERVAL)
+                if not done_r:
+                    await _horde_cancel(session, api_key, retry_id)
+                    return error_response(
+                        error="Horde re-submit after bad worker timed out",
+                        error_type="timeout",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                st_r = await _horde_status(session, api_key, retry_id)
+                rgens_r = st_r.get("generations", [])
+                if not rgens_r:
+                    return error_response(
+                        error="Horde re-submit returned no generations",
+                        error_type="empty_response",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                first_gen = rgens_r[0]
+                img_url = first_gen.get("img")
+                if not img_url:
+                    return error_response(
+                        error="Re-submit generation missing image URL",
+                        error_type="empty_response",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+                image_bytes = await _download_image(session, img_url)
+                if image_bytes is None:
+                    return error_response(
+                        error="Failed to download re-submitted image",
+                        error_type="io_error",
+                        provider="horde",
+                        model=horde_model,
+                        prompt=prompt,
+                    )
+            if broken_attempts:
+                logger.info(
+                    "Horde recovered after %d bad-worker attempt(s); new worker=%s",
+                    len(broken_attempts),
+                    first_gen.get("worker_name", "?"),
                 )
 
             # 5. Save to cache
