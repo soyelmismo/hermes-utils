@@ -1151,7 +1151,8 @@ def _handle_custom_generate(args: Dict[str, Any], **kw: Any) -> str:
         # Merge all args into kwargs for the provider
         kwargs = {"prompt": prompt}
         for key in ("model", "aspect_ratio", "steps", "cfg_scale",
-                     "sampler", "seed", "negative_prompt"):
+                     "sampler", "seed", "negative_prompt",
+                     "image_url", "reference_image_urls", "denoising_strength", "source_processing"):
             if key in args and args[key] is not None:
                 kwargs[key] = args[key]
 
