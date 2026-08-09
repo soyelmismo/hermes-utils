@@ -443,6 +443,7 @@ class HordeImageGenProvider(ImageGenProvider):
         p.setdefault("cfg_scale", cfg_defaults.get("default_cfg_scale", 7.0))
         p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_euler_a"))
         p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 768))
+        p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
 
         model_id = p.get("model", DEFAULT_MODEL)
         aspect = resolve_aspect_ratio(p.get("aspect_ratio"))
@@ -452,6 +453,13 @@ class HordeImageGenProvider(ImageGenProvider):
         sampler = p.get("sampler", "k_euler_a")
         seed = p.get("seed")
         negative = p.get("negative_prompt", "")
+
+        # Compat: if user passed "prompt ### negative" inline, split it
+        # (Civitai / WebUI convention) — only if no explicit negative_prompt given
+        if not negative and " ### " in prompt:
+            prompt, negative = prompt.split(" ### ", 1)
+            prompt = prompt.strip()
+            negative = negative.strip()
 
         # Resolve model name for Horde API
         model_meta = MODELS.get(model_id)
