@@ -49,6 +49,90 @@ REQUEST_TIMEOUT = 60   # http request timeout
 # when its post-gen NSFW detector trips. We re-submit the same request (different
 # worker pool) up to this many times before giving up.
 MAX_CENSORED_RETRIES = 3
+# Max size for source images (downloaded and sent as base64)
+MAX_SOURCE_IMAGE_SIZE = 1024
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _download_and_encode_image(url: str, max_size: int = MAX_SOURCE_IMAGE_SIZE) -> Optional[str]:
+    """Download an image from URL (http/https/data: URI/file path) and return base64 JPEG.
+    
+    Returns None if download or conversion fails.
+    """
+    import base64
+    import io
+    from pathlib import Path
+    from PIL import Image
+    
+    try:
+        image_bytes = None
+        
+        # data: URI
+        if url.startswith("data:"):
+            # data:image/jpeg;base64,/9j/4AAQ...
+            if "," in url:
+                b64_part = url.split(",", 1)[1]
+                image_bytes = base64.b64decode(b64_part)
+        
+        # Local file path
+        elif url.startswith("/") or url.startswith("~") or (len(url) > 1 and url[1] == ":"):
+            path = Path(url).expanduser()
+            if path.exists():
+                image_bytes = path.read_bytes()
+        
+        # HTTP/HTTPS URL
+        elif url.startswith("http://") or url.startswith("https://"):
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+        
+        if not image_bytes:
+            return None
+        
+        # Convert to JPEG base64
+        return await asyncio.to_thread(_encode_image_sync, image_bytes, max_size)
+        
+    except Exception as e:
+        logger.warning("Failed to download/encode image %s: %s", url, e)
+        return None
+
+
+def _encode_image_sync(image_bytes: bytes, max_size: int) -> Optional[str]:
+    """Synchronous image processing (runs in thread pool)."""
+    import base64
+    import io
+    from PIL import Image
+    
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Resize if too large
+        if img.width > max_size or img.height > max_size:
+            img.thumbnail((max_size, max_size))
+        
+        # Convert to RGB (remove alpha for JPEG)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=95)
+        buffer.seek(0)
+        
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        
+    except Exception as e:
+        logger.error("Error encoding image: %s", e)
+        return None
+
+
+def _download_and_encode_image_sync(url: str, max_size: int = MAX_SOURCE_IMAGE_SIZE) -> Optional[str]:
+    """Synchronous wrapper for _download_and_encode_image (runs in thread pool)."""
+    return asyncio.run(_download_and_encode_image(url, max_size))
 
 # ---------------------------------------------------------------------------
 # Model catalog  — curated subset of popular Horde models
@@ -211,6 +295,13 @@ PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
         "default": "",
         "description": "Things to avoid in the image.",
         "category": "basic",
+    },
+    "source_processing": {
+        "type": "str",
+        "default": "img2img",
+        "options": ["img2img", "inpainting", "outpainting", "remix", "txt2img"],
+        "description": "How to process the source image (img2img, inpainting, outpainting, remix).",
+        "category": "advanced",
     },
 }
 
@@ -415,10 +506,20 @@ class HordeImageGenProvider(ImageGenProvider):
             for key, meta in PARAMS_METADATA.items()
         ]
 
+    def capabilities(self) -> Dict[str, Any]:
+        """Horde supports text-to-image and image-to-image (img2img/inpainting/outpainting/remix)."""
+        return {
+            "modalities": ["text", "image"],
+            "max_reference_images": 4,
+        }
+
     def generate(
         self,
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Generate an image via Horde API.
@@ -461,6 +562,14 @@ class HordeImageGenProvider(ImageGenProvider):
             prompt = prompt.strip()
             negative = negative.strip()
 
+        # Image-to-image / img2img: download and encode source image (sync, runs in thread pool)
+        source_image_b64 = None
+        if image_url:
+            source_image_b64 = self._download_and_encode_image_sync(image_url)
+        elif reference_image_urls:
+            # Use first reference image as source if no explicit image_url
+            source_image_b64 = self._download_and_encode_image_sync(reference_image_urls[0])
+
         # Resolve model name for Horde API
         model_meta = MODELS.get(model_id)
         if not model_meta:
@@ -492,6 +601,16 @@ class HordeImageGenProvider(ImageGenProvider):
             if isinstance(pp, str):
                 pp = [pp]
             horde_params["post_processing"] = pp
+
+        # Image-to-image: add source_image and source_processing if available
+        source_processing = p.get("source_processing", "img2img")
+        if source_image_b64:
+            horde_params["source_image"] = source_image_b64
+            horde_params["source_processing"] = source_processing
+            # denoising_strength is only used for img2img/inpainting/outpainting
+            denoising = p.get("denoising_strength")
+            if denoising is not None and source_processing in ("img2img", "inpainting", "outpainting"):
+                horde_params["denoising_strength"] = denoising
 
         # Root-level params per the AI Horde v2 API spec (swagger.json).
         # Note: an unrelated "use_nsfw_censor" flag appears in the worker's
