@@ -545,6 +545,8 @@ class HordeImageGenProvider(ImageGenProvider):
         p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_euler_a"))
         p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 768))
         p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
+        # denoise/strength via config, NOT via tool argument
+        p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.6))
 
         model_id = p.get("model", DEFAULT_MODEL)
         aspect = resolve_aspect_ratio(p.get("aspect_ratio"))
@@ -992,7 +994,8 @@ class HordeImageGenProvider(ImageGenProvider):
         """Read user-configured defaults from ``image_gen.horde`` in config.yaml.
         
         Supported keys (all optional):
-          default_steps, default_cfg_scale, default_sampler, negative_prompt
+          default_steps, default_cfg_scale, default_sampler, negative_prompt,
+          denoising_strength
         """
         defaults: Dict[str, Any] = {}
         try:
@@ -1003,7 +1006,8 @@ class HordeImageGenProvider(ImageGenProvider):
                 horde_cfg = section.get("horde", {})
                 if isinstance(horde_cfg, dict):
                     for key in ("default_steps", "default_cfg_scale",
-                                "default_sampler", "negative_prompt"):
+                                "default_sampler", "negative_prompt",
+                                "denoising_strength"):
                         if key in horde_cfg and horde_cfg[key] is not None:
                             defaults[key] = horde_cfg[key]
         except Exception:
