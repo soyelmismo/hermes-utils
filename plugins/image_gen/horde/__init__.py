@@ -567,10 +567,10 @@ class HordeImageGenProvider(ImageGenProvider):
         # Image-to-image / img2img: download and encode source image (sync, runs in thread pool)
         source_image_b64 = None
         if image_url:
-            source_image_b64 = self._download_and_encode_image_sync(image_url)
+            source_image_b64 = _download_and_encode_image_sync(image_url)
         elif reference_image_urls:
             # Use first reference image as source if no explicit image_url
-            source_image_b64 = self._download_and_encode_image_sync(reference_image_urls[0])
+            source_image_b64 = _download_and_encode_image_sync(reference_image_urls[0])
 
         # Resolve model name for Horde API
         model_meta = MODELS.get(model_id)
