@@ -99,7 +99,8 @@ async def _download_and_encode_image(url: str, max_size: int = MAX_SOURCE_IMAGE_
         if not image_bytes:
             return None
         
-        # Convert to JPEG base64
+        # Convert to WEBP base64 (Horde API requires webp: "The Base64-encoded
+        # webp to use for img2img" — swagger GenerationInputStable.source_image)
         return await asyncio.to_thread(_encode_image_sync, image_bytes, max_size)
         
     except Exception as e:
@@ -125,7 +126,7 @@ def _encode_image_sync(image_bytes: bytes, max_size: int) -> Optional[str]:
             img = img.convert("RGB")
         
         buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=95)
+        img.save(buffer, format="WEBP", quality=95)
         buffer.seek(0)
         
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -582,13 +583,14 @@ class HordeImageGenProvider(ImageGenProvider):
 
         # Apply config-driven defaults (lowest priority)
         cfg_defaults = self._load_config_defaults()
-        p.setdefault("steps", cfg_defaults.get("default_steps", 25))
-        p.setdefault("cfg_scale", cfg_defaults.get("default_cfg_scale", 7.0))
-        p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_euler_a"))
-        p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 768))
+        p.setdefault("steps", cfg_defaults.get("default_steps", 20))
+        p.setdefault("cfg_scale", cfg_defaults.get("default_cfg_scale", 7.5))
+        p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_dpmpp_2m"))
+        p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 1024))
         p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
-        # denoise/strength via config, NOT via tool argument
-        p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.3))
+        # denoise/strength via config, NOT via tool argument.
+        # 0.6 proven-working (debug payload gen_5b76116c).
+        p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.6))
 
         model_id = p.get("model", DEFAULT_MODEL)
         # Framework's resolve_aspect_ratio(None) defaults to LANDSCAPE — but
@@ -636,6 +638,18 @@ class HordeImageGenProvider(ImageGenProvider):
             "width": final_w,
             "height": final_h,
             "sampler_name": sampler,
+            # Proven-working img2img params (from debug payload gen_5b76116c)
+            "hires_fix": True,
+            "hires_fix_denoising_strength": 0.75,
+            "karras": True,
+            "clip_skip": 2,
+            "facefixer_strength": 0.5,
+            "image_is_control": False,
+            "return_control_map": False,
+            "tiling": False,
+            "transparent": False,
+            "n": 1,
+            "post_processing": [],
         }
 
         if seed is not None:
@@ -650,15 +664,16 @@ class HordeImageGenProvider(ImageGenProvider):
                 pp = [pp]
             horde_params["post_processing"] = pp
 
-        # Image-to-image: add source_image and source_processing if available
+        # Image-to-image: source_image/source_processing go at ROOT level
+        # (GenerationInputStable), NOT inside params. Sending them in params
+        # makes the API ignore them -> worker does txt2img from scratch.
         source_processing = p.get("source_processing", "img2img")
+        root_source = {}
         if source_image_b64:
-            horde_params["source_image"] = source_image_b64
-            horde_params["source_processing"] = source_processing
-            # denoising_strength is only used for img2img/inpainting/outpainting
-            denoising = p.get("denoising_strength")
-            if denoising is not None and source_processing in ("img2img", "inpainting", "outpainting"):
-                horde_params["denoising_strength"] = denoising
+            root_source["source_image"] = source_image_b64
+            root_source["source_processing"] = source_processing
+            # denoising_strength goes in params (ModelGenerationInputStable)
+            horde_params["denoising_strength"] = p.get("denoising_strength", 0.6)
 
         # Root-level params per the AI Horde v2 API spec (swagger.json).
         # Note: an unrelated "use_nsfw_censor" flag appears in the worker's
@@ -669,6 +684,19 @@ class HordeImageGenProvider(ImageGenProvider):
         root: Dict[str, Any] = {
             "nsfw": p.get("nsfw", True),
             "censor_nsfw": p.get("censor_nsfw", False),
+            # Worker-selection flags from the proven-working payload
+            "trusted_workers": False,
+            "validated_backends": False,
+            "slow_workers": True,
+            "extra_slow_workers": False,
+            "workers": [],
+            "worker_blacklist": False,
+            "shared": False,
+            "replacement_filter": True,
+            "allow_downgrade": False,
+            "disable_batching": False,
+            "r2": True,
+            **root_source,
         }
 
         # Get API key
