@@ -235,7 +235,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_MODEL = "pony:realistic"
+DEFAULT_MODEL = "sdxl:albedo"
 
 # Parameter metadata for the Hermes tools UI
 PARAMS_METADATA: Dict[str, Dict[str, Any]] = {
@@ -450,16 +450,31 @@ async def _download_image(session: aiohttp.ClientSession, url: str) -> Optional[
 
 
 def _is_valid_image_bytes(data: Optional[bytes]) -> bool:
-    """Heuristic validation for worker output.
+    """Validate worker output is a real decodable image.
 
-    Rejects responses that are not actually decodable images (e.g. a worker
-    returning a tiny garbage blob). Accepts PNG and JPEG by magic bytes and
-    enforces a minimum size.
+    Workers return PNG, JPEG or WebP (sometimes as CDN URLs). Rejects
+    tiny garbage blobs (e.g. 92-byte corrupt responses) AND solid-color
+    placeholder images (some broken workers emit a flat gray canvas).
     """
     if not data or len(data) < MIN_IMAGE_BYTES:
         return False
-    # PNG magic: \x89PNG\r\n\x1a\n | JPEG magic: \xff\xd8\xff
-    return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"
+    try:
+        import io
+        from PIL import Image, ImageStat
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+        # Re-open for stats (verify() invalidates the object)
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGB")
+            # Downscale before stats for speed
+            im.thumbnail((64, 64))
+            stat = ImageStat.Stat(im)
+            # stddev across channels: a flat/solid image has ~0 stddev
+            if max(stat.stddev) < 5.0:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +566,16 @@ class HordeImageGenProvider(ImageGenProvider):
         """
         # Merge all parameter sources: 'params' dict (old style) + direct kwargs
         p = dict(kwargs.pop("params", {}))
-        p.setdefault("aspect_ratio", aspect_ratio)
+        # Only take aspect_ratio from the framework's default when the agent
+        # (or params dict) actually specified one. The framework default
+        # "landscape" must NOT silently override our square default.
+        if "aspect_ratio" not in p:
+            # kwargs.aspect_ratio arrives with the framework's own default
+            # (landscape) — indistinguishable from an explicit agent choice
+            # here, so treat anything equal to the framework default as unset.
+            if aspect_ratio is not None and aspect_ratio != DEFAULT_ASPECT_RATIO:
+                p["aspect_ratio"] = aspect_ratio
+            # else: leave unset -> resolved to "square" below
         if "model" in kwargs:
             p.setdefault("model", kwargs.pop("model"))
         # Silently absorb any remaining kwargs (forward-compat)
@@ -564,10 +588,14 @@ class HordeImageGenProvider(ImageGenProvider):
         p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 768))
         p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
         # denoise/strength via config, NOT via tool argument
-        p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.6))
+        p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.3))
 
         model_id = p.get("model", DEFAULT_MODEL)
-        aspect = resolve_aspect_ratio(p.get("aspect_ratio"))
+        # Framework's resolve_aspect_ratio(None) defaults to LANDSCAPE — but
+        # our tool schema defaults to square. Force square when unspecified.
+        aspect = p.get("aspect_ratio") or "square"
+        if aspect not in ("landscape", "square", "portrait"):
+            aspect = "square"
         base_resolution = p.get("base_resolution")
         steps = p.get("steps", 25)
         cfg = p.get("cfg_scale", 7.0)
@@ -985,14 +1013,11 @@ class HordeImageGenProvider(ImageGenProvider):
                         prompt=prompt,
                     )
                 # Re-submit same request, Horde routes to a different worker.
-                # Blacklist the broken worker so Horde cannot pick it again.
-                broken_worker = first_gen.get("worker_name") or broken_attempts[-1]
-                blacklist = list(horde_params.get("worker_blacklist", []))
-                if broken_worker not in blacklist:
-                    blacklist.append(broken_worker)
-                retry_params = {**horde_params, "worker_blacklist": blacklist}
+                # worker_blacklist is a ROOT bool ("avoid bad/known workers"),
+                # NOT a list — sending a list yields 400 validation errors.
+                retry_root = {**root_params, "worker_blacklist": True}
                 retry_resp = await _horde_generate(
-                    session, api_key, prompt, horde_model, retry_params, root_params
+                    session, api_key, prompt, horde_model, horde_params, retry_root
                 )
                 if "error" in retry_resp or "id" not in retry_resp:
                     return error_response(
@@ -1089,15 +1114,20 @@ class HordeImageGenProvider(ImageGenProvider):
             if first_gen.get("model"):
                 extra["worker_model"] = first_gen["model"]
 
+            # Report aspect from the REAL saved image (workers can ignore the
+            # requested size; don't lie in the report like None==None would)
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(path) as _im:
+                    _w, _h = _im.size
+                _real_aspect = "square" if _w == _h else ("landscape" if _w > _h else "portrait")
+            except Exception:
+                _real_aspect = "square"
             return success_response(
                 image=str(path),
                 model=horde_model,
                 prompt=prompt,
-                aspect_ratio=resolve_aspect_ratio(
-                    "square" if first_gen.get("width") == first_gen.get("height") else
-                    "landscape" if first_gen.get("width", 0) > first_gen.get("height", 0) else
-                    "portrait"
-                ),
+                aspect_ratio=_real_aspect,
                 provider="horde",
                 extra=extra,
             )
