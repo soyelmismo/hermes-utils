@@ -70,10 +70,12 @@ import contextvars
 import json as _json
 import logging
 import os
-import threading
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ssh-router")
 
@@ -92,14 +94,36 @@ _ssh_active = contextvars.ContextVar("ssh_active", default=False)
 # it but the main session doesn't.
 _cron_task_id: contextvars.ContextVar[str] = contextvars.ContextVar("_cron_task_id", default="")
 _patch_applied = False
+# Guard so _patch_cron_scheduler() doesn't chain wrappers on re-load.
+_cron_scheduler_patched = False
 # Thread-safe counter for prefixed cron jobs currently running.
 # Each cron with a device prefix increments on entry, decrements on exit.
 # When counter > 0, _patched_get_env_config allows SSH even without
 # _ssh_active (main session). This supports N parallel crons safely.
 _cron_ssh_counter = 0
 _cron_ssh_lock = threading.Lock()
+# Per-task SSH env registry: {task_id: {TERMINAL_SSH_*: value}}.
+# Parallel crons each get their own virtual env — a finishing job can no
+# longer pop() the vars out from under a still-running sibling.
+_ssh_env_registry: Dict[str, Dict[str, str]] = {}
+_ssh_env_registry_lock = threading.Lock()
 # Saved original for the terminal patch — set once by _ensure_patch
 _original_get_env_config = None
+
+
+def _set_task_ssh_env(task_id: str, env: Dict[str, str]) -> None:
+    with _ssh_env_registry_lock:
+        _ssh_env_registry[task_id] = dict(env)
+
+
+def _get_task_ssh_env(task_id: str) -> Dict[str, str]:
+    with _ssh_env_registry_lock:
+        return dict(_ssh_env_registry.get(task_id, {}))
+
+
+def _clear_task_ssh_env(task_id: str) -> None:
+    with _ssh_env_registry_lock:
+        _ssh_env_registry.pop(task_id, None)
 
 
 def _patched_get_env_config():
@@ -128,15 +152,18 @@ def _patched_get_env_config():
         # ── Check WHO requested SSH via contextvar ──
         cron_tid = _cron_task_id.get()
         if cron_tid:
-            # Cron context — force SSH with its own isolated environment
+            # Cron context — force SSH with its own isolated environment.
+            # Read from the per-task registry (set by _patched_run_job),
+            # never from global os.environ (shared with sibling crons).
+            env_t = _get_task_ssh_env(cron_tid)
             result["env_type"] = "ssh"
-            result["ssh_host"] = os.environ.get("TERMINAL_SSH_HOST", "")
-            result["ssh_user"] = os.environ.get("TERMINAL_SSH_USER", "")
-            result["ssh_port"] = int(os.environ.get("TERMINAL_SSH_PORT", "22"))
-            result["ssh_key"] = os.environ.get("TERMINAL_SSH_KEY", "")
-            cwd = result.get("cwd", "")
-            if cwd and not cwd.startswith("/root") and not cwd.startswith("/home/"):
-                result["cwd"] = f"/root" if result.get("ssh_user", "root") == "root" else f"/home/{result['ssh_user']}"
+            result["ssh_host"] = env_t.get("TERMINAL_SSH_HOST", "")
+            result["ssh_user"] = env_t.get("TERMINAL_SSH_USER", "")
+            result["ssh_port"] = int(env_t.get("TERMINAL_SSH_PORT", "22"))
+            result["ssh_key"] = env_t.get("TERMINAL_SSH_KEY", "")
+            # NOTE: do NOT override cwd here — the terminal tracks the
+            # agent's navigation naturally (cd /var/www works). Forcing
+            # cwd back to home would trap the agent in the home dir.
             log_extra = "CRON_SSH"
         elif ssh_ctx:
             # Main session requested SSH via connect_to — force SSH
@@ -145,13 +172,18 @@ def _patched_get_env_config():
             result["ssh_user"] = os.environ.get("TERMINAL_SSH_USER", "")
             result["ssh_port"] = int(os.environ.get("TERMINAL_SSH_PORT", "22"))
             result["ssh_key"] = os.environ.get("TERMINAL_SSH_KEY", "")
-            cwd = result.get("cwd", "")
-            if cwd and not cwd.startswith("/root") and not cwd.startswith("/home/"):
-                result["cwd"] = f"/root" if result.get("ssh_user", "root") == "root" else f"/home/{result['ssh_user']}"
+            # NOTE: do NOT override cwd here — same reason as CRON_SSH.
             log_extra = "MAIN_SSH"
         else:
             # Counter>0 but NOT cron context (main session, no connect_to)
-            # Stay local — cron_counter is someone else's business
+            # Stay local — cron_counter is someone else's business.
+            # Explicitly FORCE local: the global env may say "ssh" (set by
+            # a parallel cron), which would otherwise leak into this task.
+            result["env_type"] = "local"
+            result["ssh_host"] = ""
+            result["ssh_user"] = ""
+            result["ssh_port"] = 22
+            result["ssh_key"] = ""
             log_extra = "CRON_RUNNING_BUT_LOCAL"
     elif result.get("env_type") == "ssh":
         # ── Stale SSH guard: env says ssh but nobody requested it → local ──
@@ -160,9 +192,17 @@ def _patched_get_env_config():
         result["ssh_user"] = ""
         result["ssh_port"] = 22
         result["ssh_key"] = ""
-        # Reset CWD if it points to a remote path
+        # Reset CWD if it points to a remote path — ONLY when we actually
+        # know a remote env is involved. Never touch /home/… blindly:
+        # local users like /home/alice are perfectly valid local CWDs.
         cwd = result.get("cwd", "")
-        if cwd and (cwd.startswith("/root") or cwd.startswith("/home/")):
+        ssh_from_env = (
+            os.environ.get("TERMINAL_ENV") == "ssh"
+            or bool(os.environ.get("TERMINAL_SSH_HOST"))
+        )
+        if cwd and ssh_from_env and (
+            cwd.startswith("/root") or cwd.startswith("/home/")
+        ):
             result["cwd"] = os.getcwd()
         log_extra = "STALE_SSH→LOCAL"
 
@@ -238,11 +278,17 @@ def _patch_cron_scheduler():
     LIMITATION: os.environ is process-global. Parallel crons with different
     targets in the same tick will have env vars overwritten. See README.
     """
+    global _cron_scheduler_patched
+    if _cron_scheduler_patched:
+        logger.debug("ssh-router: cron scheduler already patched — skipping")
+        return
+
     try:
         import cron.scheduler as cs
     except ImportError:
-        logger.warning("Cannot patch cron scheduler — cron.scheduler not importable")
+        logger.warning("ssh-router: cron.scheduler not importable — auto-SSH for crons disabled")
         return
+    _cron_scheduler_patched = True
 
     original_run_job = cs.run_job
 
@@ -250,6 +296,8 @@ def _patch_cron_scheduler():
         global _cron_ssh_counter
         job_name = str(job.get("name") or job.get("prompt") or job.get("id", ""))
         device = None
+        _cron_task_token = None
+        _ssh_configured = False  # True only after counter increment succeeds
 
         # Parse "device:rest_of_name" convention — only match known devices
         if ":" in job_name:
@@ -268,7 +316,10 @@ def _patch_cron_scheduler():
                     target["key"], target["port"],
                 )
                 if ok:
-                    # Set env vars for the agent that's about to run
+                    # Set env vars for the agent that's about to run.
+                    # We still set global os.environ so OTHER code paths that
+                    # read it (e.g. terminal subprocesses) see SSH, but the
+                    # source of truth for this job is the per-task registry.
                     os.environ["TERMINAL_ENV"] = "ssh"
                     os.environ["TERMINAL_SSH_HOST"] = target["host"]
                     os.environ["TERMINAL_SSH_USER"] = target["user"]
@@ -277,7 +328,16 @@ def _patch_cron_scheduler():
                         os.environ["TERMINAL_SSH_KEY"] = os.path.expanduser(target["key"])
                     else:
                         os.environ.pop("TERMINAL_SSH_KEY", None)
+                    # Persist per-task env → _patched_get_env_config reads THIS
+                    tid = f"cron_{job.get('id', 'unknown')}"
                     remote_home = "/root" if target["user"] == "root" else f"/home/{target['user']}"
+                    _set_task_ssh_env(tid, {
+                        "TERMINAL_SSH_HOST": target["host"],
+                        "TERMINAL_SSH_USER": target["user"],
+                        "TERMINAL_SSH_PORT": str(target["port"]),
+                        "TERMINAL_SSH_KEY": os.path.expanduser(target["key"]) if target["key"] else "",
+                        "TERMINAL_CWD": remote_home,
+                    })
                     os.environ["TERMINAL_CWD"] = remote_home
 
                     # Mark this run as SSH-active so _patched_get_env_config
@@ -287,6 +347,7 @@ def _patch_cron_scheduler():
                     with _cron_ssh_lock:
                         _cron_ssh_counter += 1
                         _counter_after = _cron_ssh_counter
+                    _ssh_configured = True
 
                     # Set a cron-specific task_id via contextvar so the agent
                     # creates its OWN terminal environment instead of sharing
@@ -294,7 +355,7 @@ def _patch_cron_scheduler():
                     # The scheduler copies contextvars (line 1484) and runs
                     # the agent inside the copy — so the cron agent sees this
                     # value but the main session doesn't.
-                    _cron_task_id.set(f"cron_{job.get('id', 'unknown')}")
+                    _cron_task_token = _cron_task_id.set(tid)
                     logger.debug(
                         "Cron '%s': set cron task_id=%s",
                         job_name, _cron_task_id.get(),
@@ -329,15 +390,34 @@ def _patch_cron_scheduler():
             return original_run_job(job)
         finally:
             if device:
-                # Restore local environment for subsequent jobs
-                os.environ["TERMINAL_ENV"] = "local"
-                for _var in [
-                    "TERMINAL_SSH_HOST", "TERMINAL_SSH_USER",
-                    "TERMINAL_SSH_PORT", "TERMINAL_SSH_KEY", "TERMINAL_CWD",
-                ]:
-                    os.environ.pop(_var, None)
-                with _cron_ssh_lock:
-                    _cron_ssh_counter -= 1
+                # Reset the contextvar token FIRST — restores the thread's
+                # previous value so a reused executor thread is clean.
+                if _cron_task_token is not None:
+                    try:
+                        _cron_task_id.reset(_cron_task_token)
+                    except ValueError:
+                        pass  # contextvar already unset/overwritten
+
+                # Only restore global env if NO OTHER cron is still using SSH.
+                # A finishing job must not pop() vars out from under a
+                # still-running sibling (parallel cron bug).
+                # ALSO: never touch the env if the MAIN session is
+                # connected via connect_to() — it relies on these vars.
+                remaining = _cron_ssh_counter
+                if _ssh_configured:
+                    with _cron_ssh_lock:
+                        _cron_ssh_counter -= 1
+                        remaining = _cron_ssh_counter
+                main_connected = _read_state().get("mode") == "ssh"
+                # Always clear THIS job's registry entry.
+                _clear_task_ssh_env(f"cron_{job.get('id', 'unknown')}")
+                if remaining == 0 and not main_connected:
+                    os.environ["TERMINAL_ENV"] = "local"
+                    for _var in [
+                        "TERMINAL_SSH_HOST", "TERMINAL_SSH_USER",
+                        "TERMINAL_SSH_PORT", "TERMINAL_SSH_KEY", "TERMINAL_CWD",
+                    ]:
+                        os.environ.pop(_var, None)
                 logger.info("Cron '%s': disconnected from '%s'", job_name, device)
 
     cs.run_job = _patched_run_job
@@ -362,33 +442,21 @@ def _verify_patches() -> list[str]:
         if not hasattr(fn, "__wrapped__"):
             # Check by inspecting the function's code object name
             if fn.__code__.co_name != "_patched_get_env_config":
-                warnings.append("_get_env_config: patch was replaced by Hermes update")
-    except (ImportError, AttributeError) as e:
-        warnings.append(f"_get_env_config: cannot inspect — {e}")
+                warnings.append("terminal _get_env_config patch MISSING (name mismatch)")
+        else:
+            warnings.append("terminal _get_env_config patch MISSING (wrapped)")
+    except Exception as e:
+        warnings.append(f"terminal _get_env_config patch check failed: {e}")
 
-    # 2. run_job patch
+    # 2. Cron scheduler patch
     try:
-        import cron.scheduler as cs
-        fn = cs.run_job
-        if fn.__code__.co_name != "_patched_run_job":
-            warnings.append("run_job: patch was replaced by Hermes update")
-    except (ImportError, AttributeError) as e:
-        warnings.append(f"run_job: cannot inspect — {e}")
-
-    # 3. SSH state file sanity
-    if STATE_FILE.exists():
-        try:
-            state = _json.loads(STATE_FILE.read_text())
-            if state.get("mode") == "ssh" and not _ssh_active.get():
-                warnings.append(
-                    "State file says SSH but context is local — "
-                    "stale state from a crash? Run disconnect() to clean up."
-                )
-        except Exception as e:
-            warnings.append(f"State file corrupt: {e}")
+        import cron.scheduler as cs2
+        if getattr(cs2.run_job, "__name__", "") != "_patched_run_job":
+            warnings.append("cron scheduler run_job patch MISSING")
+    except Exception as e:
+        warnings.append(f"cron scheduler patch check failed: {e}")
 
     return warnings
-
 
 # ── Device config from config.yaml ─────────────────────────────────────────
 
@@ -596,6 +664,26 @@ def handle_connect_to(args: dict, **kwargs) -> str:
     # Clear the cached environment (closes existing SSH/local connection)
     _clear_current_environment()
 
+    # Force liveness re-probe for the new target — prevents a stale
+    # dead/alive cache from the previous host from leaking into the
+    # first pre_llm_call after reconnect.
+    _invalidate_liveness_cache()
+
+    # Persist state FIRST to avoid race conditions with cron cleanup
+    _write_state({
+        "mode": "ssh",
+        "host": target["host"],
+        "user": target["user"],
+        "port": target["port"],
+        "key": os.path.expanduser(target["key"]) if target["key"] else "",
+        "label": target["label"],
+        "connected_at": datetime.now().isoformat(),
+        # Save the LOCAL cwd at connect time so disconnect() can restore
+        # it — prevents violently yanking the process out of its local
+        # project dir (which usually lives under /root/...).
+        "local_cwd": os.getcwd(),
+    })
+
     # Set env vars for the new target
     os.environ["TERMINAL_ENV"] = "ssh"
     os.environ["TERMINAL_SSH_HOST"] = target["host"]
@@ -614,17 +702,6 @@ def handle_connect_to(args: dict, **kwargs) -> str:
     # Mark this task context as SSH-active so the monkey-patch knows
     # this session should use SSH, not fall back to local.
     _ssh_active.set(True)
-
-    # Persist state
-    _write_state({
-        "mode": "ssh",
-        "host": target["host"],
-        "user": target["user"],
-        "port": target["port"],
-        "key": os.path.expanduser(target["key"]) if target["key"] else "",
-        "label": target["label"],
-        "connected_at": datetime.now().isoformat(),
-    })
 
     return _json.dumps({
         "status": "ok",
@@ -650,6 +727,10 @@ def handle_disconnect(args: dict, **kwargs) -> str:
     # Clear the cached SSH environment (closes the remote connection)
     _clear_current_environment()
 
+    # Drop liveness cache too — after disconnect we're local and the
+    # old target must not report stale state.
+    _invalidate_liveness_cache()
+
     # Mark this task as local-only — the monkey-patch will return
     # env_type=local even if other tasks still have TERMINAL_ENV=ssh.
     _ssh_active.set(False)
@@ -663,13 +744,20 @@ def handle_disconnect(args: dict, **kwargs) -> str:
     ]:
         os.environ.pop(var, None)
 
-    # Also reset CWD to avoid /root corruption
-    try:
-        os.chdir(os.path.expanduser("~"))
-    except OSError:
-        pass
+    # Reset CWD ONLY back to the LOCAL directory we were in before
+    # connect_to(). We saved it in the state file at connect time.
+    # Never os.chdir() based on startswith("/root") — local Docker
+    # workspaces are /root/... and would be violently yanked to ~.
+    saved_local_cwd = state.get("local_cwd", "")
+    if saved_local_cwd:
+        try:
+            os.chdir(saved_local_cwd)
+        except OSError:
+            pass  # dir may no longer exist; harmless
 
-    os.environ["TERMINAL_CWD"] = os.path.expanduser("~")
+    # TERMINAL_CWD is the remote CWD; after disconnect there is no remote
+    # backend anymore, so drop it (the local backend uses its own default).
+    os.environ.pop("TERMINAL_CWD", None)
 
     # Clean slate — delete state file so _restore_state finds nothing
     try:
@@ -717,6 +805,275 @@ def handle_status(args: dict, **kwargs) -> str:
 
 # ── Plugin entry point ────────────────────────────────────────────────────
 
+# Liveness check cache — the pre_llm_call hook NEVER blocks on SSH.
+# A background daemon thread refreshes the probe; the hook reads cached
+# state (or optimistically assumes alive when unknown).
+_LIVENESS_CHECK_INTERVAL = 30
+_liveness_cache: Dict[str, Any] = {"ts": 0.0, "alive": False, "key": ""}
+_liveness_lock = threading.Lock()
+
+
+def _probe_host(host: str, user: str = "root", port: int = 22, key: str = "") -> bool:
+    """One-shot SSH reachability probe. ConnectTimeout=5 matches _test_ssh
+    so a host that passes connect_to() won't flap as dead in liveness."""
+    cmd = [
+        "ssh",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if key:
+        cmd.extend(["-i", os.path.expanduser(key)])
+    if port != 22:
+        cmd.extend(["-p", str(port)])
+    cmd.append(f"{user}@{host}")
+    cmd.append("true")
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=8, stdin=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _refresh_liveness_async(host: str, user: str, port: int, key: str) -> None:
+    """Probe in a background daemon thread and update the cache.
+
+    Never blocks the caller. On failure the cache keeps its last value
+    (stale-alive is safer than a spurious dead alert).
+    """
+    def _do() -> None:
+        try:
+            alive = _probe_host(host, user, port, key)
+            with _liveness_lock:
+                _liveness_cache["ts"] = time.monotonic()
+                _liveness_cache["key"] = f"{user}@{host}:{port}"
+                _liveness_cache["alive"] = alive
+        except Exception as exc:
+            logger.warning("ssh-router liveness probe failed: %s", exc)
+
+    thread = threading.Thread(target=_do, daemon=True, name="ssh-liveness")
+    thread.start()
+
+
+def _invalidate_liveness_cache() -> None:
+    """Force the next _host_is_alive() to re-probe (state unknown).
+
+    Sets alive=None (UNKNOWN) — the next call assumes ALIVE (optimistic)
+    because connect_to() just verified the host, and the background probe
+    will confirm true state within seconds. A confirmed-dead result from
+    a completed probe, in contrast, stays 'dead' for the full 30s window.
+    """
+    with _liveness_lock:
+        _liveness_cache["ts"] = 0.0
+        _liveness_cache["key"] = ""
+        _liveness_cache["alive"] = None  # None = UNKNOWN (not yet probed)
+
+
+def _mark_liveness_dead(host: str, user: str, port: int) -> None:
+    """Force the next _host_is_alive() to return False and re-probe."""
+    with _liveness_lock:
+        _liveness_cache["ts"] = 0.0
+        _liveness_cache["key"] = f"{user}@{host}:{port}"
+        _liveness_cache["alive"] = False
+
+
+def _host_is_alive(host: str, user: str = "root", port: int = 22, key: str = "") -> bool:
+    """Reachability check with background refresh — NEVER blocks.
+
+    Three states:
+      - fresh + alive is bool     → return it (either alive or confirmed dead)
+      - fresh + alive is None     → UNKNOWN: assume True (optimistic)
+      - stale                     → kick background probe + assume True
+
+    Only a COMPLETED probe writes dead into the cache (fresh, bool False),
+    so a dead host gets reported within probe time (~5s), while a fresh
+    connect_to() (which itself just verified the host) never causes a
+    spurious NOT-RESPONDING alert. Real tool failures are still caught
+    fast by the post_tool_call watchdog.
+    """
+    now = time.monotonic()
+    cache_key = f"{user}@{host}:{port}"
+    with _liveness_lock:
+        fresh = (
+            _liveness_cache.get("key") == cache_key
+            and now - _liveness_cache.get("ts", 0) < _LIVENESS_CHECK_INTERVAL
+        )
+        cached_alive = _liveness_cache.get("alive")
+    if not fresh:
+        _refresh_liveness_async(host, user, port, key)
+        if cached_alive is False:
+            return False  # keep returning dead until probe says otherwise
+        return True  # optimistic — probe will confirm within seconds
+    if cached_alive is None:
+        return True  # UNKNOWN → assume alive (watchdog catches real failures)
+    return bool(cached_alive)
+
+
+def _task_is_ssh() -> bool:
+    """True when the CURRENT task actually runs over SSH.
+
+    Mirrors _patched_get_env_config's decision logic:
+      - cron job marked SSH (its contextvar + TERMINAL_ENV=ssh) → True
+      - main session with _ssh_active=True                      → True
+      - anything else (local session, isolated task, orphaned state
+        file after a crash)                                     → False
+    """
+    try:
+        tid = _cron_task_id.get()
+        if tid:
+            return bool(_get_task_ssh_env(tid))
+        return bool(_ssh_active.get())
+    except Exception:
+        return False
+
+
+# SSH transport failure markers — scoped to OpenSSH client errors so
+# legitimate command output ("curl: connection refused", "git push:
+# permission denied") never triggers a false alarm.
+_SSH_TRANSPORT_MARKERS = [
+    "ssh: connect to host",
+    "ssh_exchange_identification",
+    "kex_exchange_identification",
+    "host key verification failed",
+    "permission denied (publickey",
+]
+
+
+def _is_ssh_failure_text(text: str) -> bool:
+    """True only for genuine OpenSSH client transport failures.
+
+    Strict: OpenSSH's own diagnostics ("ssh: connect to host ... timed
+    out", "ssh_exchange_identification") or the standalone markers. A URL
+    like "curl http://x/ssh_keys: connection timed out" contains no ssh:
+    prefix and won't match. Generic network phrases (without "ssh:")
+    never match either — a remote curl/wget could legitimately fail that
+    way without the SSH transport being broken.
+    """
+    lower = text.lower()
+    # OpenSSH client diagnostics all carry the program prefix "ssh:" or
+    # ssh_exchange/kex markers. "ssh:" is never a bare URL scheme, so
+    # false positives from URLs like http://host/ssh_keys are impossible.
+    if "ssh:" in lower or any(m in lower for m in _SSH_TRANSPORT_MARKERS):
+        return True
+    return False
+
+
+def _ssh_connection_watchdog(**kwargs) -> Optional[Dict[str, str]]:
+    """post_tool_call hook — detect SSH connection failures on any tool call.
+
+    Runs after EVERY tool call (terminal, read_file, write_file, patch,
+    search_files, ...). When the result indicates an SSH transport-class
+    error, returns context telling the agent the remote link is broken,
+    and invalidates the liveness cache so the next turn re-probes.
+
+    Returns None (no-op) for local mode, successful calls, or non-SSH
+    command errors — only real connection failures trigger.
+    """
+    try:
+        state = _read_state()
+        if state.get("mode") != "ssh":
+            return None
+        # Only alert when THIS task actually runs over SSH — a local task
+        # (after restart, isolated, or disconnected) must never see an
+        # SSH alert for a stale state file.
+        if not _task_is_ssh():
+            return None
+        if kwargs.get("status") == "error":
+            err = str(
+                kwargs.get("error_message")
+                or kwargs.get("error")
+                or kwargs.get("result")
+                or ""
+            )
+            if _is_ssh_failure_text(err):
+                host = state.get("host", "")
+                user = state.get("user", "root")
+                port = state.get("port", 22)
+                _mark_liveness_dead(host, user, port)
+                label = state.get("label", "") or host
+                return {
+                    "context": (
+                        f"⚠️ SSH ROUTER ALERT: Connection FAILED to \"{label}\" "
+                        f"({host}). The remote host did not respond to a tool call. "
+                        "Do NOT retry blindly — verify connectivity first, then "
+                        "call disconnect() to return to local, or reconnect when "
+                        "the host is back."
+                    )
+                }
+        return None
+    except Exception as exc:
+        logger.warning("ssh-router post_tool_call watchdog failed: %s", exc)
+        return None
+
+
+def _ssh_status_hook(**kwargs) -> Optional[Dict[str, str]]:
+    """pre_llm_call hook — inject current SSH routing status into the prompt.
+
+    Returns a dict with 'context' (injected into the user message every
+    turn) so the agent always knows which host it is operating on, and
+    whether that host is actually reachable right now.
+
+    - local / no active SSH for THIS task → None (silent)
+    - ssh + host alive      → "Connected to ..." + execution-context
+    - ssh + host unreachable→ "⚠️ host NOT responding" alert so the agent
+                              never mistakes a dead link for a live one.
+
+    The liveness probe runs in a background daemon thread (never blocks
+    the turn) and is cached for LIVENESS_CHECK_INTERVAL seconds.
+    """
+    try:
+        state = _read_state()
+        if state.get("mode") != "ssh":
+            return None
+        # Context isolation: a cron job or isolated task running LOCALLY
+        # (or a task that disconnected) must not see SSH context, even if
+        # the state file still says "ssh" (e.g. after a crash).
+        if not _task_is_ssh():
+            return None
+
+        host = state.get("host", "")
+        user = state.get("user", "")
+        port = state.get("port", 22)
+        key = state.get("key", "")
+        label = state.get("label", "") or f"{user}@{host}"
+        port_str = f":{port}" if port != 22 else ""
+
+        alive = _host_is_alive(host, user, port, key)
+
+        if not alive:
+            return {
+                "context": (
+                    f"⚠️ SSH ROUTER ALERT: Host \"{label}\" ({user}@{host}{port_str}) "
+                    "is NOT RESPONDING. The remote connection is dead or unreachable. "
+                    "Any tool call (terminal, read_file, write_file, patch, search_files) "
+                    "will FAIL with connection errors. Do NOT resolve paths against this "
+                    "host; verify connectivity first, then call disconnect() to return "
+                    "to local or reconnect when the host is back."
+                )
+            }
+
+        return {
+            "context": (
+                f"SSH Router Status: Connected to \"{label}\" "
+                f"({user}@{host}{port_str}). "
+                "IMPORTANT EXECUTION CONTEXT: Any tool that executes commands "
+                "or reads, writes, searches, or modifies files — including "
+                "terminal(), read_file(), write_file(), patch(), and "
+                "search_files() — runs natively on this remote host. "
+                "Resolve and verify every path against this remote host, not "
+                "the local machine, before acting. All terminal commands and "
+                "file operations remain remote until you call disconnect()."
+            )
+        }
+    except Exception as exc:
+        logger.warning("ssh-router pre_llm_call hook failed: %s", exc)
+        return None
+
+
 def register(ctx) -> None:
     """Register the ssh-router tools with Hermes."""
 
@@ -728,6 +1085,12 @@ def register(ctx) -> None:
 
     # Restore previous SSH state if we were connected before restart
     _restore_state()
+
+    # Register pre_llm_call hook to inject SSH status into every turn's context
+    ctx.register_hook("pre_llm_call", _ssh_status_hook)
+
+    # Register post_tool_call watchdog to alert on SSH connection failures
+    ctx.register_hook("post_tool_call", _ssh_connection_watchdog)
 
     # ── connect_to ──────────────────────────────────────────────────────
     ctx.register_tool(
