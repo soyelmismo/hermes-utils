@@ -21,6 +21,11 @@ plugins/
 │   ├── plugin.yaml              # Hermes manifest: name, kind, version
 │   └── __init__.py              # Python entry point — register() function
 │
+├── incoming-video/              # hook — auto-process incoming videos
+│   ├── README.md
+│   ├── plugin.yaml              # kind: standalone, provides_hooks: [pre_llm_call]
+│   └── __init__.py
+│
 └── image_gen/
     └── horde/                   # image generation — AI Horde backend
         ├── README.md
