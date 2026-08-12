@@ -11,9 +11,9 @@ Hermes' built-in SSH backend (`terminal.backend: ssh`) is static — it ties the
 With `ssh-router`, the agent itself can switch targets mid-session:
 
 ```
-You: "Connect to my PC"        → agent: connect_to(device="pc")
-You: "Switch to the laptop"    → agent: disconnect() + connect_to(device="laptop")
-You: "Go back to local"        → agent: disconnect()
+You: "Connect to my PC"        → agent: ssh_router_connect_to(device="pc")
+You: "Switch to the laptop"    → agent: ssh_router_disconnect() + ssh_router_connect_to(device="laptop")
+You: "Go back to local"        → agent: ssh_router_disconnect()
 ```
 
 All tools follow transparently: `terminal()`, `read_file()`, `write_file()`, `patch()`, `search_files()` — everything executes on the current target.
@@ -32,19 +32,19 @@ The plugin solves this with a **monkey-patch + `contextvars`** approach:
 
 1. On load, it patches Hermes' `_get_env_config()` to wrap the env-var reading
 2. A `contextvars.ContextVar("ssh_active")` tracks whether the **current asyncio task** authorized SSH
-3. `connect_to()` sets the context var to `True` for the calling task
+3. `ssh_router_connect_to()` sets the context var to `True` for the calling task
 4. The patch checks: if `TERMINAL_ENV=ssh` but `ssh_active` is `False` in this task's context → return `env_type="local"`
 5. Cron jobs and new background tasks always see `ssh_active=False` by default → they run **local** regardless of global env
 
 This means:
-- **Main agent session** → SSH after `connect_to()` ✓
+- **Main agent session** → SSH after `ssh_router_connect_to()` ✓
 - **Subagents** → inherit parent context → SSH ✓
 - **Cron jobs** → fresh context → local ✓
-- **Gateway restart** → all contexts start fresh → local until explicit `connect_to()` ✓
+- **Gateway restart** → all contexts start fresh → local until explicit `ssh_router_connect_to()` ✓
 
 ### Persistence
 
-State is saved to `~/.hermes/ssh_target.json` when connected, and **deleted** on `disconnect()`. After a gateway restart, if the state file exists (e.g. from a crash), the plugin prepares env vars but SSH stays inactive — you must call `connect_to()` explicitly. No silent auto-reconnect.
+State is saved to `~/.hermes/ssh_target.json` when connected, and **deleted** on `ssh_router_disconnect()`. After a gateway restart, if the state file exists (e.g. from a crash), the plugin prepares env vars but SSH stays inactive — you must call `ssh_router_connect_to()` explicitly. No silent auto-reconnect.
 
 ### Cron auto-routing (transparent SSH for scheduled jobs)
 
@@ -61,7 +61,7 @@ The plugin:
 2. Tests SSH connectivity to that device
 3. Auto-connects before the agent runs (sets env vars + cron counter)
 4. Runs the cron prompt — the agent's `terminal()`, `read_file()`, etc. execute remotely
-5. Auto-disconnects after — cleans env for the next job
+5. Auto-ssh_router_disconnects after — cleans env for the next job
 
 Convention: `device_name:job_description`. The device name must exist in `plugins.ssh-router.devices` in `config.yaml`.
 
@@ -170,27 +170,27 @@ ssh -i ~/.ssh/hermes_pc user@192.168.1.100 "echo OK"
 
 | You say | What happens |
 |---------|-------------|
-| "Connect to my PC" | Agent calls `connect_to(device="pc")` |
-| "Switch to the laptop" | Agent calls `disconnect()` then `connect_to(device="laptop")` |
-| "Go back local" / "Disconnect" | Agent calls `disconnect()` |
-| "Where are you?" | Agent calls `ssh_status()` |
+| "Connect to my PC" | Agent calls `ssh_router_connect_to(device="pc")` |
+| "Switch to the laptop" | Agent calls `ssh_router_disconnect()` then `ssh_router_connect_to(device="laptop")` |
+| "Go back local" / "Disconnect" | Agent calls `ssh_router_disconnect()` |
+| "Where are you?" | Agent calls `ssh_router_status()` |
 
 ### For agents (direct tool calls)
 
 ```
-connect_to(device="pc")
+ssh_router_connect_to(device="pc")
   → Tests SSH → sets TERMINAL_ENV=ssh → clears cached env
   → Next terminal() and read_file() go remote
   → "Connected to user@192.168.1.100"
 
-connect_to(host="10.0.0.5", user="admin", key="~/.ssh/admin_key")
+ssh_router_connect_to(host="10.0.0.5", user="admin", key="~/.ssh/admin_key")
   → Same but for ad-hoc targets not in device config
 
-disconnect()
+ssh_router_disconnect()
   → Clears SSH env → restores TERMINAL_ENV=local
   → "Disconnected. Back to local."
 
-ssh_status()
+ssh_router_status()
   → Shows current mode (local/ssh) and target
 ```
 
@@ -219,7 +219,7 @@ You are an AI agent. To install and use this plugin:
 
 5. **Restart the gateway** — signal the host to restart the Hermes gateway process.
 
-6. **Verify** — call `ssh_status()` to confirm the plugin loaded and devices are available.
+6. **Verify** — call `ssh_router_status()` to confirm the plugin loaded and devices are available.
 
 ## Architecture
 
@@ -231,9 +231,9 @@ You are an AI agent. To install and use this plugin:
 │  │  ssh-router   │    │  Built-in terminal tool          │   │
 │  │  plugin       │    │                                  │   │
 │  │               │    │  1. Calls _get_env_config()       │   │
-│  │  connect_to() │    │     ┌──────────────────────┐     │   │
-│  │  disconnect() │    │     │ monkey-patch wrapper │     │   │
-│  │  ssh_status() │    │     │                      │     │   │
+│  │  ssh_router_connect_to() │    │     ┌──────────────────────┐     │   │
+│  │  ssh_router_disconnect() │    │     │ monkey-patch wrapper │     │   │
+│  │  ssh_router_status() │    │     │                      │     │   │
 │  └───────┬───────┘    │     │ if TERMINAL_ENV=ssh   │     │   │
 │          │            │     │  AND _ssh_active=False│     │   │
 │          │  1. Sets   │     │  → force local        │     │   │
@@ -255,7 +255,7 @@ You are an AI agent. To install and use this plugin:
 
 ### "Unknown device 'X'"
 
-Check device names are correctly spelled in `config.yaml` under `plugins.ssh-router.devices`. Call `ssh_status()` to see the list of available devices.
+Check device names are correctly spelled in `config.yaml` under `plugins.ssh-router.devices`. Call `ssh_router_status()` to see the list of available devices.
 
 ### "SSH connection failed"
 
@@ -275,7 +275,7 @@ Check device names are correctly spelled in `config.yaml` under `plugins.ssh-rou
 
 ### File tools don't follow the SSH target
 
-File tools (`read_file`, `write_file`, `patch`) inherit the same environment from env vars. They automatically route through SSH when the terminal backend is SSH. If they're still reading locally, try `disconnect()` + `connect_to(device=...)` again to reset the environment.
+File tools (`read_file`, `write_file`, `patch`) inherit the same environment from env vars. They automatically route through SSH when the terminal backend is SSH. If they're still reading locally, try `ssh_router_disconnect()` + `ssh_router_connect_to(device=...)` again to reset the environment.
 
 ## License
 
