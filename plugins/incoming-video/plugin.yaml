@@ -1,0 +1,14 @@
+name: incoming-video
+version: 1.0.0
+manifest_version: 1
+description: >-
+  Auto-process incoming videos before the LLM sees them: extract the cached
+  video path from the gateway's attachment note, transcribe the audio track
+  with the configured STT provider (transcribe_audio -> stt.provider in
+  config.yaml), extract frames with ffmpeg, and inject the result into the
+  turn via the pre_llm_call hook.
+author: Hermeona
+kind: standalone
+
+provides_hooks:
+  - pre_llm_call
