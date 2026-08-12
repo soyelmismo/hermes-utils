@@ -37,6 +37,45 @@ sudo systemctl restart hermes-gateway
 - A configured STT provider (`stt.provider` in `config.yaml`) — e.g. openproxy whisper.
 - The plugin runs in the gateway process, so it has access to `tools.transcription_tools`.
 
+## For AI agents configuring this plugin
+
+If you (an agent) are asked to install this plugin on a Hermes installation, follow this protocol exactly:
+
+1. **Check the target layout.** Hermes discovers plugins in `~/.hermes/plugins/<name>/`. The canonical source is this repo (`plugins/incoming-video/`). The standard install is a **symlink**, not a copy:
+
+   ```bash
+   ln -s "$PWD/plugins/incoming-video" ~/.hermes/plugins/incoming-video
+   ```
+
+2. **Enable it** in `~/.hermes/config.yaml`:
+
+   ```yaml
+   plugins:
+     enabled:
+       - incoming-video
+   ```
+
+3. **Verify prerequisites** before restarting:
+   - `ffmpeg` and `ffprobe` must be on the gateway's PATH (systemd unit `Environment=PATH=...` — `/usr/bin` is enough).
+   - `stt.provider` must be set in `config.yaml` (e.g. `openproxy`). If it isn't, the transcription step fails and the hook degrades to frames-only.
+
+4. **Restart the gateway** so the plugin loads:
+
+   ```bash
+   sudo systemctl restart hermes-gateway
+   ```
+
+5. **Verify it loaded**:
+
+   ```bash
+   hermes plugins list | grep incoming-video
+   # expect: incoming-video │ enabled │ 1.0.0
+   ```
+
+6. **Smoke test** (optional but recommended): send a short video via the platform and check `~/.hermes/cache/videos/` for `<video>_frame_01.png` and the injected `[Transcripción del vídeo]` block in the agent's context.
+
+**If the user is on a systemd gateway, never restart it yourself from inside the agent** — it kills the session. Tell the user to run the restart.
+
 ## Known limitations
 
 - **Synchronous hook**: `pre_llm_call` is sync, so the gateway blocks while transcribing (30–60s for a 2-min clip). Acceptable in DMs since the gateway serializes messages anyway.

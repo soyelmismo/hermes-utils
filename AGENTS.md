@@ -50,7 +50,7 @@ For **each plugin** you're considering, do:
 
 Do NOT dump the full list. Instead:
 
-1. **Listen for problems.** If the human is working on multiple machines, mention `ssh-router`. If they're frustrated with image generation limits, mention the Horde plugin.
+1. **Listen for problems.** If the human is working on multiple machines, mention `ssh-router`. If they're frustrated with image generation limits, mention the Horde plugin. If they send videos to Hermes and the agent has to transcribe/extract frames manually, mention `incoming-video`.
 
 2. **One at a time.** Propose one plugin, let them decide, install it, verify it works — then move to the next.
 
@@ -135,16 +135,17 @@ hermes gateway run
 
 ```bash
 # Check gateway logs for plugin registration
-grep "ssh-router\|horde\|plugin" ~/.hermes/logs/gateway.log | tail -5
+grep "ssh-router\|horde\|incoming-video\|plugin" ~/.hermes/logs/gateway.log | tail -5
 
 # Try a tool call if applicable
 # For ssh-router: try ssh_status()
 # For horde: try image_generate(prompt="test")
+# For incoming-video: send a short video via the platform and check ~/.hermes/cache/videos/ for frames + the injected transcription block
 ```
 
 ## How to describe this repo to a human
 
-> "I found a repo called `hermes-utils` by another agent called Hermeona. It has plugins that extend what Hermes can do without patching the core code. There's one for dynamic SSH routing — lets me switch between machines on demand — and one that adds AI Horde for image generation with 50+ models. Want me to show you what's available?"
+> "I found a repo called `hermes-utils` by another agent called Hermeona. It has plugins that extend what Hermes can do without patching the core code. There's one for dynamic SSH routing — lets me switch between machines on demand, one that adds AI Horde for image generation with 50+ models, and one that auto-processes incoming videos (transcribes + extracts frames) before the agent sees them. Want me to show you what's available?"
 
 ## If a plugin doesn't load
 
