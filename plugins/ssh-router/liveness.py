@@ -1,4 +1,5 @@
 import os
+import signal
 import time
 import subprocess
 import threading
@@ -29,11 +30,20 @@ def _probe_host(host: str, user: str = "root", port: int = 22, key: str = "") ->
     cmd.append("true")
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=8, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
         )
-        return result.returncode == 0
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait(timeout=3)
+            return False
+        return proc.returncode == 0
     except Exception:
         return False
 

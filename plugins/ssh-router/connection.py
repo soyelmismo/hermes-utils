@@ -1,6 +1,8 @@
 import os
+import signal
 import subprocess
 import logging
+import threading
 from .config import _read_state, get_remote_home
 
 logger = logging.getLogger("ssh-router")
@@ -34,13 +36,20 @@ def _get_task_id() -> str:
     except Exception:
         return "default"
 
+_CLEANUP_TIMEOUT = 15
+
 def _clear_current_environment() -> None:
     """Close and remove the cached environment so the next call creates a new one."""
     task_id = _get_task_id()
     try:
         from tools.terminal_tool import cleanup_vm
-        cleanup_vm(task_id)
-        logger.info("Cleared environment for task %s", task_id)
+        thread = threading.Thread(target=cleanup_vm, args=(task_id,), daemon=True)
+        thread.start()
+        thread.join(timeout=_CLEANUP_TIMEOUT)
+        if thread.is_alive():
+            logger.warning("cleanup_vm timed out after %ds for task %s — proceeding anyway", _CLEANUP_TIMEOUT, task_id)
+        else:
+            logger.info("Cleared environment for task %s", task_id)
     except Exception as e:
         logger.warning("Error clearing environment: %s", e)
 
@@ -48,6 +57,7 @@ def _test_ssh(host: str, user: str, key: str = "", port: int = 22) -> tuple:
     """
     Quick connectivity test before switching to a remote target.
     Returns (success: bool, message: str).
+    Uses start_new_session + os.killpg to avoid pipe-inheritance hangs.
     """
     cmd = [
         "ssh",
@@ -63,13 +73,24 @@ def _test_ssh(host: str, user: str, key: str = "", port: int = 22) -> tuple:
     cmd.append("echo HERMES_SSH_OK")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and "HERMES_SSH_OK" in result.stdout:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait(timeout=3)
+            return False, "SSH connection timed out (10s)"
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
+        if proc.returncode == 0 and "HERMES_SSH_OK" in stdout_text:
             return True, f"Connected to {user}@{host}:{port}"
-        stderr = result.stderr.strip()[:200]
-        return False, f"SSH connection failed: {stderr}"
-    except subprocess.TimeoutExpired:
-        return False, "SSH connection timed out (10s)"
+        return False, f"SSH connection failed: {stderr_text.strip()[:200]}"
     except FileNotFoundError:
         return False, "SSH client not found on this machine"
     except Exception as e:
