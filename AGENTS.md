@@ -76,6 +76,19 @@ grep -A 5 'enabled:' ~/.hermes/config.yaml | grep '<name>'
 
 ## Installation steps (for automating the process)
 
+### Step 0: Clone the repo (once)
+
+The canonical source of all plugins is this repository. Clone it **once** — every plugin is then installed as a **symlink** into `~/.hermes/plugins/`, so future updates are a single `git pull`.
+
+```bash
+# Clone into a stable location (pick one — keep it consistent across machines)
+git clone https://github.com/soyelmismo/hermes-utils.git /root/code/leagent/hermes-utils
+# or
+git clone https://github.com/soyelmismo/hermes-utils.git ~/hermes-utils
+```
+
+> **Why clone + symlink instead of copying?** With a symlink, the plugin's real files live in the cloned repo. When the repo gets updated (`git pull`), every symlinked plugin updates **automatically** — no re-copy, no drift, no version mismatch. Copying works but goes stale.
+
 ### Step 1: Check prerequisites
 
 Read the plugin's README. Note any:
@@ -83,15 +96,15 @@ Read the plugin's README. Note any:
 - Required system packages → check with `which <tool>`
 - SSH keys → check with `test -f ~/.ssh/<key>`
 
-### Step 2: Copy or symlink the plugin directory
+### Step 2: Symlink the plugin directory (from the cloned repo)
 
-Two options. Prefer the symlink — it auto-updates when the repo is pulled:
+The plugin's real files stay in the clone; `~/.hermes/plugins/<name>` is just a pointer to them:
 
 ```bash
-# Option A: Symlink (recommended — live updates from git pull)
+# Symlink (recommended — live updates from git pull)
 ln -sf /path/to/hermes-utils/plugins/<name> ~/.hermes/plugins/<name>
 
-# Option B: Copy (standalone, survives repo deletion)
+# Only if symlinking is impossible (e.g. different filesystem, no permission):
 cp -r /path/to/hermes-utils/plugins/<name> ~/.hermes/plugins/<name>
 ```
 
@@ -142,6 +155,23 @@ grep "ssh-router\|horde\|incoming-video\|plugin" ~/.hermes/logs/gateway.log | ta
 # For horde: try image_generate(prompt="test")
 # For incoming-video: send a short video via the platform and check ~/.hermes/cache/videos/ for frames + the injected transcription block
 ```
+
+## Updating plugins (git pull)
+
+Because every plugin is a symlink into the cloned repo, updating all plugins is one command:
+
+```bash
+cd /path/to/hermes-utils   # the clone from Step 0
+git pull
+```
+
+That's it. The symlinks in `~/.hermes/plugins/` now point at the new files automatically. **Restart the gateway** afterwards so the new code loads:
+
+```bash
+sudo systemctl restart hermes-gateway   # or: hermes gateway restart
+```
+
+> **Never `git pull` while the gateway is mid-turn on a long task** — the plugin files change under the running process. Do it between turns, then restart.
 
 ## How to describe this repo to a human
 

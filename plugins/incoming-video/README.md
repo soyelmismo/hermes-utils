@@ -21,15 +21,24 @@ The agent then sees the transcription and frame paths as normal context — no m
 
 ## Install
 
+The canonical install is **clone the repo once + symlink** — so updates are a single `git pull`:
+
 ```bash
-# from the repo root
-ln -s "$PWD/plugins/incoming-video" ~/.hermes/plugins/incoming-video
-# enable in config.yaml
+# 1. Clone the repo (once, anywhere stable)
+git clone https://github.com/soyelmismo/hermes-utils.git /root/code/leagent/hermes-utils
+
+# 2. Symlink the plugin into Hermes (real files stay in the clone)
+ln -s /root/code/leagent/hermes-utils/plugins/incoming-video ~/.hermes/plugins/incoming-video
+
+# 3. Enable in config.yaml
 #   plugins:
 #     enabled: [..., incoming-video]
-# restart the gateway
+
+# 4. Restart the gateway
 sudo systemctl restart hermes-gateway
 ```
+
+**To update later:** `cd /root/code/leagent/hermes-utils && git pull` then restart the gateway. The symlink picks up the new files automatically.
 
 ## Requirements
 
@@ -41,7 +50,13 @@ sudo systemctl restart hermes-gateway
 
 If you (an agent) are asked to install this plugin on a Hermes installation, follow this protocol exactly:
 
-1. **Check the target layout.** Hermes discovers plugins in `~/.hermes/plugins/<name>/`. The canonical source is this repo (`plugins/incoming-video/`). The standard install is a **symlink**, not a copy:
+0. **Clone the repo** (if not already present) — this is the canonical source and enables future `git pull` updates:
+
+   ```bash
+   git clone https://github.com/soyelmismo/hermes-utils.git /root/code/leagent/hermes-utils
+   ```
+
+1. **Check the target layout.** Hermes discovers plugins in `~/.hermes/plugins/<name>/`. The standard install is a **symlink** into the clone, not a copy:
 
    ```bash
    ln -s "$PWD/plugins/incoming-video" ~/.hermes/plugins/incoming-video
