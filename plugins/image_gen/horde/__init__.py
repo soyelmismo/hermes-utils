@@ -21,11 +21,11 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import aiohttp
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -36,6 +36,18 @@ from agent.image_gen_provider import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_aiohttp() -> Any:
+    """Lazy import aiohttp to avoid importing at module load time."""
+    import aiohttp
+    return aiohttp
+
+
+# Module-level plugin context and async job registry
+_PLUGIN_CTX: Any = None
+_LAST_SESSION_KEY: Optional[str] = None
+_JOBS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # Horde API
@@ -90,6 +102,7 @@ async def _download_and_encode_image(url: str, max_size: int = MAX_SOURCE_IMAGE_
         
         # HTTP/HTTPS URL
         elif url.startswith("http://") or url.startswith("https://"):
+            aiohttp = _get_aiohttp()
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as resp:
@@ -358,7 +371,7 @@ def _sanitize_key(text: str, api_key: str) -> str:
 
 
 async def _horde_generate(
-    session: aiohttp.ClientSession,
+    session: Any,
     api_key: str,
     prompt: str,
     model_horde_name: str,
@@ -399,7 +412,55 @@ async def _horde_generate(
         return await resp.json()
 
 
-async def _horde_check(session: aiohttp.ClientSession, api_key: str, generation_id: str) -> Dict[str, Any]:
+def _horde_submit_sync(
+    api_key: str,
+    prompt: str,
+    model_horde_name: str,
+    params: Dict[str, Any],
+    root_params: Dict[str, Any],
+    timeout: int = REQUEST_TIMEOUT,
+) -> Dict[str, Any]:
+    """Submit a generation request synchronously to Horde via HTTP POST (<2s)."""
+    payload = {
+        "prompt": prompt,
+        "params": params,
+        **root_params,
+    }
+    if model_horde_name:
+        payload["models"] = [model_horde_name]
+
+    headers = {
+        "apikey": api_key,
+        "Client-Agent": "HermesAgent:HordePlugin:v1.0.0:hermeona",
+        "Content-Type": "application/json",
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{HORDE_API_URL}/generate/async",
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            if resp.status != 202:
+                msg = _sanitize_key(f"Generation failed ({resp.status}): {body}", api_key)
+                logger.error(msg)
+                return {"error": msg}
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        msg = _sanitize_key(f"Generation failed ({e.code}): {body}", api_key)
+        logger.error(msg)
+        return {"error": msg}
+    except Exception as exc:
+        msg = _sanitize_key(f"Generation request failed: {exc}", api_key)
+        logger.error(msg)
+        return {"error": msg}
+
+
+async def _horde_check(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Check generation status."""
     headers = {"apikey": api_key}
     async with session.get(
@@ -412,7 +473,7 @@ async def _horde_check(session: aiohttp.ClientSession, api_key: str, generation_
         return await resp.json()
 
 
-async def _horde_status(session: aiohttp.ClientSession, api_key: str, generation_id: str) -> Dict[str, Any]:
+async def _horde_status(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Get generation results."""
     headers = {"apikey": api_key}
     async with session.get(
@@ -425,7 +486,7 @@ async def _horde_status(session: aiohttp.ClientSession, api_key: str, generation
         return await resp.json()
 
 
-async def _horde_cancel(session: aiohttp.ClientSession, api_key: str, generation_id: str) -> Dict[str, Any]:
+async def _horde_cancel(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Cancel a generation."""
     headers = {"apikey": api_key}
     async with session.delete(
@@ -437,7 +498,7 @@ async def _horde_cancel(session: aiohttp.ClientSession, api_key: str, generation
         return await resp.json()
 
 
-async def _download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+async def _download_image(session: Any, url: str) -> Optional[bytes]:
     """Download image bytes from a URL."""
     try:
         async with session.get(url) as resp:
@@ -565,36 +626,80 @@ class HordeImageGenProvider(ImageGenProvider):
         contract) and/or ``params`` dict (backward-compat). Any unknown kwargs
         are silently ignored.
         """
-        # Merge all parameter sources: 'params' dict (old style) + direct kwargs
-        p = dict(kwargs.pop("params", {}))
-        # Only take aspect_ratio from the framework's default when the agent
-        # (or params dict) actually specified one. The framework default
-        # "landscape" must NOT silently override our square default.
+        api_key, horde_model, horde_params, root, meta = self._prepare_request_params(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_url=image_url,
+            reference_image_urls=reference_image_urls,
+            **kwargs,
+        )
+
+        logger.info(
+            "Horde generate: model=%s prompt=%.80s size=%dx%d steps=%d cfg=%.1f",
+            meta["model_display"], prompt, meta["final_w"], meta["final_h"], meta["steps"], meta["cfg"],
+        )
+
+        import concurrent.futures
+
+        def _run_async() -> Dict[str, Any]:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(
+                    self._generate_async(api_key, prompt, horde_model, horde_params, root, meta)
+                )
+            finally:
+                new_loop.close()
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(_run_async).result()
+            return result
+        except Exception as exc:
+            logger.error("Horde generation failed", exc_info=True)
+            return error_response(
+                error=f"Horde generation failed: {exc}",
+                error_type="api_error",
+                provider="horde",
+                model=meta.get("model_id", horde_model),
+                prompt=prompt,
+                aspect_ratio=meta.get("aspect", "square"),
+            )
+
+    def _prepare_request_params(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Build and validate parameters for a Horde API request.
+
+        Returns:
+            (api_key, horde_model, horde_params, root_params, meta)
+        """
+        p = dict(kwargs.pop("params", {})) if "params" in kwargs else {}
+        for k, v in kwargs.items():
+            if v is not None:
+                p[k] = v
+
+        # Aspect ratio resolution
         if "aspect_ratio" not in p:
-            # kwargs.aspect_ratio arrives with the framework's own default
-            # (landscape) — indistinguishable from an explicit agent choice
-            # here, so treat anything equal to the framework default as unset.
             if aspect_ratio is not None and aspect_ratio != DEFAULT_ASPECT_RATIO:
                 p["aspect_ratio"] = aspect_ratio
-            # else: leave unset -> resolved to "square" below
-        if "model" in kwargs:
-            p.setdefault("model", kwargs.pop("model"))
-        # Silently absorb any remaining kwargs (forward-compat)
 
-        # Apply config-driven defaults (lowest priority)
+        # Config-driven defaults
         cfg_defaults = self._load_config_defaults()
         p.setdefault("steps", cfg_defaults.get("default_steps", 20))
         p.setdefault("cfg_scale", cfg_defaults.get("default_cfg_scale", 7.5))
         p.setdefault("sampler", cfg_defaults.get("default_sampler", "k_dpmpp_2m"))
         p.setdefault("base_resolution", cfg_defaults.get("default_base_resolution", 1024))
         p.setdefault("negative_prompt", cfg_defaults.get("negative_prompt", ""))
-        # denoise/strength via config, NOT via tool argument.
-        # 0.6 proven-working (debug payload gen_5b76116c).
         p.setdefault("denoising_strength", cfg_defaults.get("denoising_strength", 0.6))
 
         model_id = p.get("model", DEFAULT_MODEL)
-        # Framework's resolve_aspect_ratio(None) defaults to LANDSCAPE — but
-        # our tool schema defaults to square. Force square when unspecified.
         aspect = p.get("aspect_ratio") or "square"
         if aspect not in ("landscape", "square", "portrait"):
             aspect = "square"
@@ -605,22 +710,19 @@ class HordeImageGenProvider(ImageGenProvider):
         seed = p.get("seed")
         negative = p.get("negative_prompt", "")
 
-        # Compat: if user passed "prompt ### negative" inline, split it
-        # (Civitai / WebUI convention) — only if no explicit negative_prompt given
+        # Inline negative prompt parsing
         if not negative and " ### " in prompt:
             prompt, negative = prompt.split(" ### ", 1)
             prompt = prompt.strip()
             negative = negative.strip()
 
-        # Image-to-image / img2img: download and encode source image (sync, runs in thread pool)
+        # Image-to-image
         source_image_b64 = None
         if image_url:
             source_image_b64 = _download_and_encode_image_sync(image_url)
         elif reference_image_urls:
-            # Use first reference image as source if no explicit image_url
             source_image_b64 = _download_and_encode_image_sync(reference_image_urls[0])
 
-        # Resolve model name for Horde API
         model_meta = MODELS.get(model_id)
         if not model_meta:
             horde_model = model_id
@@ -631,14 +733,12 @@ class HordeImageGenProvider(ImageGenProvider):
 
         final_w, final_h = _resolve_size(base_resolution, aspect)
 
-        # Build Horde params
         horde_params: Dict[str, Any] = {
             "cfg_scale": cfg,
             "steps": steps,
             "width": final_w,
             "height": final_h,
             "sampler_name": sampler,
-            # Proven-working img2img params (from debug payload gen_5b76116c)
             "hires_fix": True,
             "hires_fix_denoising_strength": 0.75,
             "karras": True,
@@ -657,34 +757,22 @@ class HordeImageGenProvider(ImageGenProvider):
         if negative:
             horde_params["negative_prompt"] = negative
 
-        # Post-processing
         pp = p.get("post_processing", [])
         if pp:
             if isinstance(pp, str):
                 pp = [pp]
             horde_params["post_processing"] = pp
 
-        # Image-to-image: source_image/source_processing go at ROOT level
-        # (GenerationInputStable), NOT inside params. Sending them in params
-        # makes the API ignore them -> worker does txt2img from scratch.
         source_processing = p.get("source_processing", "img2img")
-        root_source = {}
+        root_source: Dict[str, Any] = {}
         if source_image_b64:
             root_source["source_image"] = source_image_b64
             root_source["source_processing"] = source_processing
-            # denoising_strength goes in params (ModelGenerationInputStable)
             horde_params["denoising_strength"] = p.get("denoising_strength", 0.6)
 
-        # Root-level params per the AI Horde v2 API spec (swagger.json).
-        # Note: an unrelated "use_nsfw_censor" flag appears in the worker's
-        # internal source, but it is NOT part of the public client-side
-        # payload — sending it is a no-op. The actual control fields are:
-        #   - nsfw: bool   — accept NSFW workers/content
-        #   - censor_nsfw: bool — request the worker NOT censor (worker chooses)
         root: Dict[str, Any] = {
             "nsfw": p.get("nsfw", True),
             "censor_nsfw": p.get("censor_nsfw", False),
-            # Worker-selection flags from the proven-working payload
             "trusted_workers": False,
             "validated_backends": False,
             "slow_workers": True,
@@ -699,42 +787,18 @@ class HordeImageGenProvider(ImageGenProvider):
             **root_source,
         }
 
-        # Get API key
         api_key = self._load_api_key()
-        logger.info(
-            "Horde generate: model=%s prompt=%.80s size=%dx%d steps=%d cfg=%.1f",
-            model_display, prompt, final_w, final_h, steps, cfg,
-        )
-
-        # Run async generation in a dedicated thread with its own event loop
-        # to avoid "Event loop is closed" errors when the gateway already has
-        # a running loop in the main thread.
-        import concurrent.futures
-
-        def _run_async() -> Dict[str, Any]:
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            try:
-                return new_loop.run_until_complete(
-                    self._generate_async(api_key, prompt, horde_model, horde_params, root)
-                )
-            finally:
-                new_loop.close()
-
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(_run_async).result()
-            return result
-        except Exception as exc:
-            logger.error("Horde generation failed", exc_info=True)
-            return error_response(
-                error=f"Horde generation failed: {exc}",
-                error_type="api_error",
-                provider="horde",
-                model=model_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+        meta = {
+            "prompt": prompt,
+            "aspect": aspect,
+            "model_id": model_id,
+            "model_display": model_display,
+            "final_w": final_w,
+            "final_h": final_h,
+            "steps": steps,
+            "cfg": cfg,
+        }
+        return api_key, horde_model, horde_params, root, meta
 
     # ------------------------------------------------------------------
     # Internal async orchestration
@@ -747,418 +811,17 @@ class HordeImageGenProvider(ImageGenProvider):
         horde_model: str,
         horde_params: Dict[str, Any],
         root_params: Dict[str, Any],
+        meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Full async generation lifecycle: submit → poll → download → save.
-        
-        Creates its own aiohttp session to ensure thread-safety — each
-        generation runs in its own thread with its own event loop, so the
-        session must not be shared across threads.
-        """
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-
-            # 1. Submit
-            gen_resp = await _horde_generate(session, api_key, prompt, horde_model, horde_params, root_params)
-            if "error" in gen_resp:
-                return error_response(
-                    error=f"Horde API error: {gen_resp['error']}",
-                    error_type="api_error",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            generation_id = gen_resp.get("id")
-            if not generation_id:
-                return error_response(
-                    error="Horde returned no generation ID",
-                    error_type="empty_response",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            # 2. Poll until done
-            deadline = time.monotonic() + DEFAULT_TIMEOUT
-            while time.monotonic() < deadline:
-                check = await _horde_check(session, api_key, generation_id)
-                if "error" in check:
-                    return error_response(
-                        error=f"Status check error: {check['error']}",
-                        error_type="api_error",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                if check.get("done"):
-                    break
-                await asyncio.sleep(POLL_INTERVAL)
-            else:
-                # Timeout — try to cancel
-                await _horde_cancel(session, api_key, generation_id)
-                return error_response(
-                    error=f"Generation timed out after {DEFAULT_TIMEOUT}s",
-                    error_type="timeout",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            # 3. Get result
-            result = await _horde_status(session, api_key, generation_id)
-            if "error" in result:
-                return error_response(
-                    error=f"Result fetch error: {result['error']}",
-                    error_type="api_error",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            generations = result.get("generations", [])
-            if not generations:
-                return error_response(
-                    error="Horde returned no images",
-                    error_type="empty_response",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            # 4. Detect worker-side censorship BEFORE downloading the (censored) image.
-            # Per AI Horde v2 API spec (swagger.json), a generation object can signal
-            # censorship via three fields (priority order):
-            #   1. gen_metadata[] with type="censorship", value="csam" -> child-safety, NEVER retry
-            #   2. gen_metadata[] with type="censorship", value in {"nsfw","censorlist",...} -> NSFW filter, retry
-            #   3. censored: bool (in GenerationStable) -> true means worker replaced image, retry
-            #   4. state: "ok" | "censored" (in Generation, OBSOLETE) -> "censored" means retry
-            #
-            # We check in order 1->2->3->4. gen_metadata is authoritative.
-            first_gen = generations[0]
-
-            # Helper: extract censorship info from a generation dict
-            def _censorship_info(gen: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-                """
-                Returns (censorship_type, worker_name) where censorship_type is:
-                  "csam"       -> child-safety, non-retryable
-                  "nsfw"       -> NSFW filter (nsfw, censorlist, baseline_mismatch, etc.)
-                  "unknown"    -> censored=true or state="censored" but no gen_metadata
-                  None         -> clean
-                """
-                # 1. gen_metadata is authoritative
-                for meta in gen.get("gen_metadata", []):
-                    if meta.get("type") == "censorship":
-                        val = meta.get("value")
-                        if val == "csam":
-                            return "csam", gen.get("worker_name")
-                        if val in ("nsfw", "censorlist", "baseline_mismatch", "see_ref"):
-                            return "nsfw", gen.get("worker_name")
-                        # Any other censorship value -> treat as nsfw (retryable)
-                        return "nsfw", gen.get("worker_name")
-                # 2. censored bool (GenerationStable extension)
-                if gen.get("censored") is True:
-                    return "unknown", gen.get("worker_name")
-                # 3. state field (Generation, OBSOLETE)
-                if gen.get("state") == "censored":
-                    return "unknown", gen.get("worker_name")
-                return None, None
-
-            # Check initial generation
-            ctype, cworker = _censorship_info(first_gen)
-            if ctype == "csam":
-                logger.warning(
-                    "Horde generation flagged CSAM by worker %s; aborting (no retry)",
-                    cworker or "?",
-                )
-                return error_response(
-                    error=(
-                        "Generation aborted by worker child-safety filter (gen_metadata=csam). "
-                        "This is non-retryable."
-                    ),
-                    error_type="csam_rejected",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            censored_attempts: List[str] = []
-            while ctype in ("nsfw", "unknown"):
-                censored_attempts.append(cworker or "?")
-                logger.warning(
-                    "Horde censored by worker %s on model %s (type=%s, attempt %d/%d)",
-                    cworker or "?",
-                    horde_model,
-                    ctype,
-                    len(censored_attempts),
-                    MAX_CENSORED_RETRIES,
-                )
-                if len(censored_attempts) >= MAX_CENSORED_RETRIES:
-                    return error_response(
-                        error=(
-                            f"Generation censored by {len(censored_attempts)} consecutive "
-                            f"workers on model {horde_model}: {censored_attempts}. "
-                            f"No more retries."
-                        ),
-                        error_type="censored_after_retry",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                # Re-submit with the same model — different worker pool
-                retry_resp = await _horde_generate(
-                    session, api_key, prompt, horde_model, horde_params, root_params,
-                )
-                if "error" in retry_resp:
-                    return error_response(
-                        error=f"Horde retry submit failed: {retry_resp['error']}",
-                        error_type="api_error",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                retry_id = retry_resp.get("id")
-                if not retry_id:
-                    return error_response(
-                        error="Horde retry returned no generation ID",
-                        error_type="empty_response",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                # Poll
-                deadline_r = time.monotonic() + DEFAULT_TIMEOUT
-                timed_out = False
-                while time.monotonic() < deadline_r:
-                    chk = await _horde_check(session, api_key, retry_id)
-                    if "error" in chk:
-                        return error_response(
-                            error=f"Horde retry status check error: {chk['error']}",
-                            error_type="api_error",
-                            provider="horde",
-                            model=horde_model,
-                            prompt=prompt,
-                        )
-                    if chk.get("done"):
-                        break
-                    await asyncio.sleep(POLL_INTERVAL)
-                else:
-                    timed_out = True
-                if timed_out:
-                    await _horde_cancel(session, api_key, retry_id)
-                    return error_response(
-                        error=f"Horde retry timed out after {DEFAULT_TIMEOUT}s",
-                        error_type="timeout",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                # Status
-                st = await _horde_status(session, api_key, retry_id)
-                if "error" in st:
-                    return error_response(
-                        error=f"Horde retry result fetch error: {st['error']}",
-                        error_type="api_error",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                rgens = st.get("generations", [])
-                if not rgens:
-                    return error_response(
-                        error="Horde retry returned no images",
-                        error_type="empty_response",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                rfirst = rgens[0]
-                # Re-evaluate censorship on the retry
-                ctype, cworker = _censorship_info(rfirst)
-                if ctype == "csam":
-                    return error_response(
-                        error="Retry aborted by worker child-safety filter (gen_metadata=csam)",
-                        error_type="csam_rejected",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                # If still censored (nsfw/unknown), loop again. Otherwise accept.
-                if ctype in ("nsfw", "unknown"):
-                    first_gen = rfirst
-                    continue
-                # Success on retry
-                first_gen = rfirst
-                logger.info(
-                    "Horde retry succeeded after %d censored attempt(s); new worker=%s",
-                    len(censored_attempts),
-                    rfirst.get("worker_name", "?"),
-                )
-                break
-
-            # 4b. Download the first image
-            img_url = first_gen.get("img")
-            if not img_url:
-                return error_response(
-                    error="Generation missing image URL",
-                    error_type="empty_response",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            image_bytes = await _download_image(session, img_url)
-            if image_bytes is None:
-                return error_response(
-                    error="Failed to download generated image",
-                    error_type="io_error",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            # 4c. Validate downloaded bytes — a worker may return a "done" job
-            # with garbage (not an image). Re-submit to a different worker up to
-            # MAX_BROKEN_RETRIES times before giving up.
-            broken_attempts: List[str] = []
-            while not _is_valid_image_bytes(image_bytes):
-                broken_attempts.append(first_gen.get("worker_name", "?"))
-                logger.warning(
-                    "Horde worker %s returned invalid image bytes (%d B, attempt %d/%d); re-submitting",
-                    broken_attempts[-1],
-                    len(image_bytes or b""),
-                    len(broken_attempts),
-                    MAX_BROKEN_RETRIES,
-                )
-                if len(broken_attempts) >= MAX_BROKEN_RETRIES:
-                    return error_response(
-                        error=(
-                            f"Generation returned invalid image data {len(broken_attempts)} "
-                            f"consecutive times ({broken_attempts}); giving up."
-                        ),
-                        error_type="bad_worker_output",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                # Re-submit same request, Horde routes to a different worker.
-                # worker_blacklist is a ROOT bool ("avoid bad/known workers"),
-                # NOT a list — sending a list yields 400 validation errors.
-                retry_root = {**root_params, "worker_blacklist": True}
-                retry_resp = await _horde_generate(
-                    session, api_key, prompt, horde_model, horde_params, retry_root
-                )
-                if "error" in retry_resp or "id" not in retry_resp:
-                    return error_response(
-                        error=f"Horde re-submit after bad worker failed: {retry_resp.get('error', retry_resp)}",
-                        error_type="api_error",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                retry_id = retry_resp["id"]
-                # Poll until done
-                deadline_r = time.monotonic() + DEFAULT_TIMEOUT
-                done_r = False
-                while time.monotonic() < deadline_r:
-                    chk = await _horde_check(session, api_key, retry_id)
-                    if "error" in chk:
-                        break
-                    if chk.get("done"):
-                        done_r = True
-                        break
-                    await asyncio.sleep(POLL_INTERVAL)
-                if not done_r:
-                    await _horde_cancel(session, api_key, retry_id)
-                    return error_response(
-                        error="Horde re-submit after bad worker timed out",
-                        error_type="timeout",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                st_r = await _horde_status(session, api_key, retry_id)
-                rgens_r = st_r.get("generations", [])
-                if not rgens_r:
-                    return error_response(
-                        error="Horde re-submit returned no generations",
-                        error_type="empty_response",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                first_gen = rgens_r[0]
-                img_url = first_gen.get("img")
-                if not img_url:
-                    return error_response(
-                        error="Re-submit generation missing image URL",
-                        error_type="empty_response",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-                image_bytes = await _download_image(session, img_url)
-                if image_bytes is None:
-                    return error_response(
-                        error="Failed to download re-submitted image",
-                        error_type="io_error",
-                        provider="horde",
-                        model=horde_model,
-                        prompt=prompt,
-                    )
-            if broken_attempts:
-                logger.info(
-                    "Horde recovered after %d bad-worker attempt(s); new worker=%s",
-                    len(broken_attempts),
-                    first_gen.get("worker_name", "?"),
-                )
-
-            # 5. Save to cache
-            try:
-                from agent.image_gen_provider import _images_cache_dir
-                cache_dir = _images_cache_dir()
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                short = uuid.uuid4().hex[:8]
-                seed_used = first_gen.get("seed", "?")
-                ext = "png"
-                safe_model = horde_model.replace(" ", "_").replace("/", "_")
-                filename = f"horde_{safe_model}_{ts}_{short}.{ext}"
-                path = cache_dir / filename
-                path.write_bytes(image_bytes)
-                logger.info("Image saved: %s (%d bytes, seed=%s)", path, len(image_bytes), seed_used)
-            except Exception as exc:
-                return error_response(
-                    error=f"Could not save image to cache: {exc}",
-                    error_type="io_error",
-                    provider="horde",
-                    model=horde_model,
-                    prompt=prompt,
-                )
-
-            # 6. Build response
-            extra: Dict[str, Any] = {
-                "size": f"{first_gen.get('width', '?')}x{first_gen.get('height', '?')}",
-                "seed": seed_used,
-            }
-            if first_gen.get("model"):
-                extra["worker_model"] = first_gen["model"]
-
-            # Report aspect from the REAL saved image (workers can ignore the
-            # requested size; don't lie in the report like None==None would)
-            try:
-                from PIL import Image as _PILImage
-                with _PILImage.open(path) as _im:
-                    _w, _h = _im.size
-                _real_aspect = "square" if _w == _h else ("landscape" if _w > _h else "portrait")
-            except Exception:
-                _real_aspect = "square"
-            return success_response(
-                image=str(path),
-                model=horde_model,
-                prompt=prompt,
-                aspect_ratio=_real_aspect,
-                provider="horde",
-                extra=extra,
-            )
+        """Full async generation lifecycle: submit → poll → download → save."""
+        return await _execute_lifecycle(
+            api_key=api_key,
+            prompt=prompt,
+            horde_model=horde_model,
+            horde_params=horde_params,
+            root_params=root_params,
+            meta=meta or {},
+        )
 
     # ------------------------------------------------------------------
     # Config defaults from config.yaml
@@ -1170,7 +833,7 @@ class HordeImageGenProvider(ImageGenProvider):
         
         Supported keys (all optional):
           default_steps, default_cfg_scale, default_sampler, negative_prompt,
-          denoising_strength
+          denoising_strength, async, async_mode, session_key
         """
         defaults: Dict[str, Any] = {}
         try:
@@ -1180,9 +843,12 @@ class HordeImageGenProvider(ImageGenProvider):
             if isinstance(section, dict):
                 horde_cfg = section.get("horde", {})
                 if isinstance(horde_cfg, dict):
-                    for key in ("default_steps", "default_cfg_scale",
-                                "default_sampler", "negative_prompt",
-                                "denoising_strength"):
+                    for key in (
+                        "default_steps", "default_cfg_scale",
+                        "default_sampler", "negative_prompt",
+                        "denoising_strength", "async", "async_mode",
+                        "session_key",
+                    ):
                         if key in horde_cfg and horde_cfg[key] is not None:
                             defaults[key] = horde_cfg[key]
         except Exception:
@@ -1223,7 +889,664 @@ class HordeImageGenProvider(ImageGenProvider):
 
 
 # ---------------------------------------------------------------------------
-# Plugin entry point + custom tool replacement
+# Shared lifecycle implementation
+# ---------------------------------------------------------------------------
+
+
+async def _execute_lifecycle(
+    api_key: str,
+    prompt: str,
+    horde_model: str,
+    horde_params: Dict[str, Any],
+    root_params: Dict[str, Any],
+    meta: Dict[str, Any],
+    session: Optional[Any] = None,
+    initial_job_id: Optional[str] = None,
+    on_status_update: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Execute complete generation lifecycle: submit/poll → censorship/worker check → download → cache."""
+    if session is None:
+        aiohttp = _get_aiohttp()
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            return await _execute_lifecycle(
+                api_key=api_key,
+                prompt=prompt,
+                horde_model=horde_model,
+                horde_params=horde_params,
+                root_params=root_params,
+                meta=meta,
+                session=sess,
+                initial_job_id=initial_job_id,
+                on_status_update=on_status_update,
+            )
+
+    # 1. Submit if job ID not already provided
+    if initial_job_id:
+        generation_id = initial_job_id
+        if on_status_update:
+            on_status_update("queued", {"job_id": generation_id})
+    else:
+        gen_resp = await _horde_generate(session, api_key, prompt, horde_model, horde_params, root_params)
+        if "error" in gen_resp:
+            return error_response(
+                error=f"Horde API error: {gen_resp['error']}",
+                error_type="api_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+
+        generation_id = gen_resp.get("id")
+        if not generation_id:
+            return error_response(
+                error="Horde returned no generation ID",
+                error_type="empty_response",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        if on_status_update:
+            on_status_update("queued", {"job_id": generation_id})
+
+    # 2. Poll until done
+    deadline = time.monotonic() + DEFAULT_TIMEOUT
+    while time.monotonic() < deadline:
+        check = await _horde_check(session, api_key, generation_id)
+        if "error" in check:
+            return error_response(
+                error=f"Status check error: {check['error']}",
+                error_type="api_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        if on_status_update:
+            on_status_update("polling", check)
+        if check.get("done"):
+            break
+        await asyncio.sleep(POLL_INTERVAL)
+    else:
+        await _horde_cancel(session, api_key, generation_id)
+        return error_response(
+            error=f"Generation timed out after {DEFAULT_TIMEOUT}s",
+            error_type="timeout",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    # 3. Get result
+    result = await _horde_status(session, api_key, generation_id)
+    if "error" in result:
+        return error_response(
+            error=f"Result fetch error: {result['error']}",
+            error_type="api_error",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    generations = result.get("generations", [])
+    if not generations:
+        return error_response(
+            error="Horde returned no images",
+            error_type="empty_response",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    first_gen = generations[0]
+
+    # 4. Detect worker-side censorship
+    def _censorship_info(gen: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        for meta_elem in gen.get("gen_metadata", []):
+            if meta_elem.get("type") == "censorship":
+                val = meta_elem.get("value")
+                if val == "csam":
+                    return "csam", gen.get("worker_name")
+                if val in ("nsfw", "censorlist", "baseline_mismatch", "see_ref"):
+                    return "nsfw", gen.get("worker_name")
+                return "nsfw", gen.get("worker_name")
+        if gen.get("censored") is True:
+            return "unknown", gen.get("worker_name")
+        if gen.get("state") == "censored":
+            return "unknown", gen.get("worker_name")
+        return None, None
+
+    ctype, cworker = _censorship_info(first_gen)
+    if ctype == "csam":
+        logger.warning(
+            "Horde generation flagged CSAM by worker %s; aborting (no retry)",
+            cworker or "?",
+        )
+        return error_response(
+            error=(
+                "Generation aborted by worker child-safety filter (gen_metadata=csam). "
+                "This is non-retryable."
+            ),
+            error_type="csam_rejected",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    censored_attempts: List[str] = []
+    while ctype in ("nsfw", "unknown"):
+        censored_attempts.append(cworker or "?")
+        logger.warning(
+            "Horde censored by worker %s on model %s (type=%s, attempt %d/%d)",
+            cworker or "?",
+            horde_model,
+            ctype,
+            len(censored_attempts),
+            MAX_CENSORED_RETRIES,
+        )
+        if len(censored_attempts) >= MAX_CENSORED_RETRIES:
+            return error_response(
+                error=(
+                    f"Generation censored by {len(censored_attempts)} consecutive "
+                    f"workers on model {horde_model}: {censored_attempts}. "
+                    f"No more retries."
+                ),
+                error_type="censored_after_retry",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        retry_resp = await _horde_generate(
+            session, api_key, prompt, horde_model, horde_params, root_params,
+        )
+        if "error" in retry_resp:
+            return error_response(
+                error=f"Horde retry submit failed: {retry_resp['error']}",
+                error_type="api_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        retry_id = retry_resp.get("id")
+        if not retry_id:
+            return error_response(
+                error="Horde retry returned no generation ID",
+                error_type="empty_response",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        deadline_r = time.monotonic() + DEFAULT_TIMEOUT
+        timed_out = False
+        while time.monotonic() < deadline_r:
+            chk = await _horde_check(session, api_key, retry_id)
+            if "error" in chk:
+                return error_response(
+                    error=f"Horde retry status check error: {chk['error']}",
+                    error_type="api_error",
+                    provider="horde",
+                    model=horde_model,
+                    prompt=prompt,
+                )
+            if chk.get("done"):
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        else:
+            timed_out = True
+        if timed_out:
+            await _horde_cancel(session, api_key, retry_id)
+            return error_response(
+                error=f"Horde retry timed out after {DEFAULT_TIMEOUT}s",
+                error_type="timeout",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        st = await _horde_status(session, api_key, retry_id)
+        if "error" in st:
+            return error_response(
+                error=f"Horde retry result fetch error: {st['error']}",
+                error_type="api_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        rgens = st.get("generations", [])
+        if not rgens:
+            return error_response(
+                error="Horde retry returned no images",
+                error_type="empty_response",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        rfirst = rgens[0]
+        ctype, cworker = _censorship_info(rfirst)
+        if ctype == "csam":
+            return error_response(
+                error="Retry aborted by worker child-safety filter (gen_metadata=csam)",
+                error_type="csam_rejected",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        if ctype in ("nsfw", "unknown"):
+            first_gen = rfirst
+            continue
+        first_gen = rfirst
+        logger.info(
+            "Horde retry succeeded after %d censored attempt(s); new worker=%s",
+            len(censored_attempts),
+            rfirst.get("worker_name", "?"),
+        )
+        break
+
+    # 4b. Download first image
+    img_url = first_gen.get("img")
+    if not img_url:
+        return error_response(
+            error="Generation missing image URL",
+            error_type="empty_response",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    image_bytes = await _download_image(session, img_url)
+    if image_bytes is None:
+        return error_response(
+            error="Failed to download generated image",
+            error_type="io_error",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    # 4c. Validate downloaded bytes
+    broken_attempts: List[str] = []
+    while not _is_valid_image_bytes(image_bytes):
+        broken_attempts.append(first_gen.get("worker_name", "?"))
+        logger.warning(
+            "Horde worker %s returned invalid image bytes (%d B, attempt %d/%d); re-submitting",
+            broken_attempts[-1],
+            len(image_bytes or b""),
+            len(broken_attempts),
+            MAX_BROKEN_RETRIES,
+        )
+        if len(broken_attempts) >= MAX_BROKEN_RETRIES:
+            return error_response(
+                error=(
+                    f"Generation returned invalid image data {len(broken_attempts)} "
+                    f"consecutive times ({broken_attempts}); giving up."
+                ),
+                error_type="bad_worker_output",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        retry_root = {**root_params, "worker_blacklist": True}
+        retry_resp = await _horde_generate(
+            session, api_key, prompt, horde_model, horde_params, retry_root
+        )
+        if "error" in retry_resp or "id" not in retry_resp:
+            return error_response(
+                error=f"Horde re-submit after bad worker failed: {retry_resp.get('error', retry_resp)}",
+                error_type="api_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        retry_id = retry_resp["id"]
+        deadline_r = time.monotonic() + DEFAULT_TIMEOUT
+        done_r = False
+        while time.monotonic() < deadline_r:
+            chk = await _horde_check(session, api_key, retry_id)
+            if "error" in chk:
+                break
+            if chk.get("done"):
+                done_r = True
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        if not done_r:
+            await _horde_cancel(session, api_key, retry_id)
+            return error_response(
+                error="Horde re-submit after bad worker timed out",
+                error_type="timeout",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        st_r = await _horde_status(session, api_key, retry_id)
+        rgens_r = st_r.get("generations", [])
+        if not rgens_r:
+            return error_response(
+                error="Horde re-submit returned no generations",
+                error_type="empty_response",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        first_gen = rgens_r[0]
+        img_url = first_gen.get("img")
+        if not img_url:
+            return error_response(
+                error="Re-submit generation missing image URL",
+                error_type="empty_response",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+        image_bytes = await _download_image(session, img_url)
+        if image_bytes is None:
+            return error_response(
+                error="Failed to download re-submitted image",
+                error_type="io_error",
+                provider="horde",
+                model=horde_model,
+                prompt=prompt,
+            )
+    if broken_attempts:
+        logger.info(
+            "Horde recovered after %d bad-worker attempt(s); new worker=%s",
+            len(broken_attempts),
+            first_gen.get("worker_name", "?"),
+        )
+
+    # 5. Save to cache
+    try:
+        from agent.image_gen_provider import _images_cache_dir
+        cache_dir = _images_cache_dir()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        short = uuid.uuid4().hex[:8]
+        seed_used = first_gen.get("seed", "?")
+        ext = "png"
+        safe_model = horde_model.replace(" ", "_").replace("/", "_")
+        filename = f"horde_{safe_model}_{ts}_{short}.{ext}"
+        path = cache_dir / filename
+        path.write_bytes(image_bytes)
+        logger.info("Image saved: %s (%d bytes, seed=%s)", path, len(image_bytes), seed_used)
+    except Exception as exc:
+        return error_response(
+            error=f"Could not save image to cache: {exc}",
+            error_type="io_error",
+            provider="horde",
+            model=horde_model,
+            prompt=prompt,
+        )
+
+    # 6. Build response
+    extra: Dict[str, Any] = {
+        "size": f"{first_gen.get('width', '?')}x{first_gen.get('height', '?')}",
+        "seed": seed_used,
+    }
+    if first_gen.get("model"):
+        extra["worker_model"] = first_gen["model"]
+
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as _im:
+            _w, _h = _im.size
+        _real_aspect = "square" if _w == _h else ("landscape" if _w > _h else "portrait")
+    except Exception:
+        _real_aspect = meta.get("aspect", "square")
+
+    return success_response(
+        image=str(path),
+        model=horde_model,
+        prompt=prompt,
+        aspect_ratio=_real_aspect,
+        provider="horde",
+        extra=extra,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Async task runner & delivery helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_session_key(args: Optional[Dict[str, Any]] = None, **kw: Any) -> Optional[str]:
+    """Resolve session_key for message injection in priority order:
+    1. Tool dispatch kwargs (session_key, session_id, session)
+    2. Parent agent attributes if present in kwargs
+    3. Tool arguments (args.session_key)
+    4. Last recorded session_key in module global
+    5. Config setting image_gen.horde.session_key
+    """
+    global _LAST_SESSION_KEY
+    candidates = []
+    if kw:
+        candidates.extend([kw.get("session_key"), kw.get("session_id"), kw.get("session")])
+        agent = kw.get("parent_agent") or kw.get("agent")
+        if agent:
+            candidates.extend([
+                getattr(agent, "session_key", None),
+                getattr(agent, "session_id", None),
+                getattr(agent, "conversation_id", None),
+            ])
+    if args and isinstance(args, dict):
+        candidates.extend([args.get("session_key"), args.get("session_id")])
+
+    for c in candidates:
+        if c and isinstance(c, str) and c.strip():
+            _LAST_SESSION_KEY = c.strip()
+            return _LAST_SESSION_KEY
+
+    if _LAST_SESSION_KEY:
+        return _LAST_SESSION_KEY
+
+    cfg_key = HordeImageGenProvider._load_config_defaults().get("session_key")
+    if cfg_key and isinstance(cfg_key, str) and cfg_key.strip():
+        return cfg_key.strip()
+
+    return None
+
+
+def _is_async_mode(args: Optional[Dict[str, Any]] = None) -> bool:
+    """Determine whether async generation is enabled.
+    
+    Priority:
+    1. Explicit 'async' or 'async_mode' parameter in tool args
+    2. HORDE_ASYNC environment variable ('1', 'true', 'yes', 'on')
+    3. image_gen.horde.async / image_gen.horde.async_mode in config.yaml
+    Default: False (synchronous mode).
+    """
+    if args and isinstance(args, dict):
+        if "async" in args and isinstance(args["async"], bool):
+            return args["async"]
+        if "async_mode" in args and isinstance(args["async_mode"], bool):
+            return args["async_mode"]
+
+    env_async = os.environ.get("HORDE_ASYNC")
+    if env_async is not None:
+        return env_async.strip().lower() in ("1", "true", "yes", "on")
+
+    cfg = HordeImageGenProvider._load_config_defaults()
+    cfg_async = cfg.get("async", cfg.get("async_mode", False))
+    if isinstance(cfg_async, bool):
+        return cfg_async
+    if isinstance(cfg_async, str):
+        return cfg_async.strip().lower() in ("1", "true", "yes", "on")
+    return bool(cfg_async)
+
+
+def _horde_submit_async(
+    prompt: str,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Submit a generation job asynchronously to Horde and return immediately with job_id."""
+    from agent.image_gen_registry import get_active_provider
+
+    provider = get_active_provider()
+    if provider is None:
+        return {"error": "No image generation provider is active", "error_type": "no_provider"}
+
+    if not isinstance(provider, HordeImageGenProvider):
+        provider = HordeImageGenProvider()
+
+    api_key, horde_model, horde_params, root_params, meta = provider._prepare_request_params(
+        prompt=prompt,
+        **kwargs,
+    )
+
+    resp = _horde_submit_sync(
+        api_key=api_key,
+        prompt=prompt,
+        model_horde_name=horde_model,
+        params=horde_params,
+        root_params=root_params,
+    )
+    if "error" in resp:
+        return {"error": resp["error"], "error_type": "api_error"}
+
+    job_id = resp.get("id")
+    if not job_id:
+        return {"error": "Horde returned no generation ID", "error_type": "empty_response"}
+
+    return {
+        "job_id": job_id,
+        "api_key": api_key,
+        "prompt": prompt,
+        "horde_model": horde_model,
+        "horde_params": horde_params,
+        "root_params": root_params,
+        "meta": meta,
+    }
+
+
+def _spawn_task_safe(coro: Any, name: Optional[str] = None) -> Any:
+    """Spawn a supervised asyncio task via PluginContext, with background runner fallback."""
+    global _PLUGIN_CTX
+    if _PLUGIN_CTX is not None and hasattr(_PLUGIN_CTX, "spawn_task"):
+        try:
+            return _PLUGIN_CTX.spawn_task(coro, name=name)
+        except RuntimeError:
+            pass
+        except Exception as e:
+            logger.warning("ctx.spawn_task failed: %s; falling back to thread runner", e)
+
+    import threading
+
+    def _runner() -> None:
+        try:
+            asyncio.run(coro)
+        except Exception as err:
+            logger.error("Background task runner failed: %s", err, exc_info=True)
+
+    t = threading.Thread(target=_runner, daemon=True, name=name or "horde-task")
+    t.start()
+    return t
+
+
+def _deliver_message(content: str, session_key: Optional[str] = None) -> bool:
+    """Deliver a message/MEDIA to the session via PluginContext.inject_message."""
+    global _PLUGIN_CTX
+    if _PLUGIN_CTX is None:
+        logger.info("Plugin context not set; cannot inject message: %s", content)
+        return False
+
+    if session_key and hasattr(_PLUGIN_CTX, "inject_message"):
+        try:
+            ok = _PLUGIN_CTX.inject_message(content=content, role="user", session_key=session_key)
+            if ok:
+                logger.info("Injected message to session %s: %s", session_key, content)
+                return True
+        except Exception as e:
+            logger.warning("inject_message with session_key %s failed: %s", session_key, e)
+
+    if hasattr(_PLUGIN_CTX, "inject_message"):
+        try:
+            ok = _PLUGIN_CTX.inject_message(content=content, role="user")
+            if ok:
+                logger.info("Injected message to active conversation: %s", content)
+                return True
+        except Exception as e:
+            logger.warning("inject_message fallback failed: %s", e)
+
+    return False
+
+
+async def _wait_and_deliver(
+    job_id: str,
+    session_key: Optional[str],
+    api_key: str,
+    prompt: str,
+    horde_model: str,
+    horde_params: Dict[str, Any],
+    root_params: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> None:
+    """Async background task: polls Horde until generation is complete, validates, saves, and injects."""
+    logger.info("Starting _wait_and_deliver for job %s (session_key=%s)", job_id, session_key)
+    aiohttp = _get_aiohttp()
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+
+    def _on_status_update(status_str: str, data: Dict[str, Any]) -> None:
+        if job_id in _JOBS:
+            _JOBS[job_id]["status"] = status_str
+            if "wait_time" in data:
+                _JOBS[job_id]["wait_time"] = data["wait_time"]
+            if "queue_position" in data:
+                _JOBS[job_id]["queue_position"] = data["queue_position"]
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            result = await _execute_lifecycle(
+                api_key=api_key,
+                prompt=prompt,
+                horde_model=horde_model,
+                horde_params=horde_params,
+                root_params=root_params,
+                meta=meta,
+                session=session,
+                initial_job_id=job_id,
+                on_status_update=_on_status_update,
+            )
+
+        if result.get("success"):
+            img_path = result.get("image")
+            extra = result.get("extra", {})
+            if job_id in _JOBS:
+                _JOBS[job_id].update({
+                    "status": "done",
+                    "path": img_path,
+                    "seed": extra.get("seed"),
+                    "size": extra.get("size"),
+                    "completed_at": time.time(),
+                })
+            logger.info("Job %s completed successfully: %s", job_id, img_path)
+            _deliver_message(f"MEDIA:{img_path}", session_key=session_key)
+        else:
+            err_msg = result.get("error", "Generation failed")
+            err_type = result.get("error_type", "generation_error")
+            if job_id in _JOBS:
+                _JOBS[job_id].update({
+                    "status": "error",
+                    "error": err_msg,
+                    "error_type": err_type,
+                    "completed_at": time.time(),
+                })
+            logger.warning("Job %s failed: %s (%s)", job_id, err_msg, err_type)
+            _deliver_message(
+                f"❌ Error al generar imagen ({job_id}): {err_msg}",
+                session_key=session_key,
+            )
+    except Exception as exc:
+        logger.error("Exception in _wait_and_deliver for job %s: %s", job_id, exc, exc_info=True)
+        if job_id in _JOBS:
+            _JOBS[job_id].update({
+                "status": "error",
+                "error": str(exc),
+                "error_type": "internal_error",
+                "completed_at": time.time(),
+            })
+        _deliver_message(
+            f"❌ Error inesperado al generar imagen ({job_id}): {exc}",
+            session_key=session_key,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point + custom tool replacements
 # ---------------------------------------------------------------------------
 
 # Schema for our replacement image_generate tool
@@ -1300,14 +1623,30 @@ CUSTOM_TOOL_SCHEMA: Dict[str, Any] = {
             "default": "",
             "description": "Things to avoid in the image. Comma-separated.",
         },
+        "async": {
+            "type": "boolean",
+            "description": "If true, submits generation in background and returns immediately.",
+        },
     },
     "required": ["prompt"],
+}
+
+# Schema for image_status tool
+IMAGE_STATUS_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "description": "Check the status of an asynchronous image generation job by job_id.",
+    "properties": {
+        "job_id": {
+            "type": "string",
+            "description": "The generation job ID returned by image_generate in async mode.",
+        },
+    },
+    "required": ["job_id"],
 }
 
 
 def _handle_custom_generate(args: Dict[str, Any], **kw: Any) -> str:
     """Handler for our custom image_generate tool."""
-    import json
     try:
         from agent.image_gen_registry import get_active_provider
 
@@ -1321,37 +1660,143 @@ def _handle_custom_generate(args: Dict[str, Any], **kw: Any) -> str:
             })
 
         prompt = args.get("prompt", "")
-        if not prompt:
+        if not prompt or not isinstance(prompt, str) or not prompt.strip():
             return json.dumps({
-                "success": False, "image": None,
-                "error": "prompt is required", "error_type": "missing_param",
+                "success": False,
+                "image": None,
+                "error": "prompt is required",
+                "error_type": "missing_param",
             })
 
         # Merge all args into kwargs for the provider
         kwargs = {"prompt": prompt}
-        for key in ("model", "aspect_ratio", "steps", "cfg_scale",
-                     "sampler", "seed", "negative_prompt",
-                     "image_url", "reference_image_urls", "denoising_strength", "source_processing"):
+        for key in (
+            "model", "aspect_ratio", "steps", "cfg_scale",
+            "sampler", "seed", "negative_prompt",
+            "image_url", "reference_image_urls", "denoising_strength", "source_processing",
+            "async", "async_mode",
+        ):
             if key in args and args[key] is not None:
                 kwargs[key] = args[key]
 
+        session_key = _resolve_session_key(args, **kw)
+
+        if _is_async_mode(args):
+            submit_res = _horde_submit_async(**kwargs)
+            if "error" in submit_res:
+                return json.dumps({
+                    "success": False,
+                    "image": None,
+                    "error": submit_res["error"],
+                    "error_type": submit_res.get("error_type", "api_error"),
+                })
+
+            job_id = submit_res["job_id"]
+            meta = submit_res["meta"]
+            _JOBS[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "prompt": prompt,
+                "model": submit_res["horde_model"],
+                "timestamp": time.time(),
+                "path": None,
+                "seed": None,
+                "size": f"{meta.get('final_w', '?')}x{meta.get('final_h', '?')}",
+                "error": None,
+                "error_type": None,
+                "session_key": session_key,
+            }
+
+            coro = _wait_and_deliver(
+                job_id=job_id,
+                session_key=session_key,
+                api_key=submit_res["api_key"],
+                prompt=submit_res["prompt"],
+                horde_model=submit_res["horde_model"],
+                horde_params=submit_res["horde_params"],
+                root_params=submit_res["root_params"],
+                meta=meta,
+            )
+            _spawn_task_safe(coro, name=f"horde:job:{job_id}")
+
+            return json.dumps({
+                "success": True,
+                "status": "queued",
+                "job_id": job_id,
+                "message": "Generación en cola... te aviso",
+                "async": True,
+            })
+
+        # Synchronous mode (default)
         result = provider.generate(**kwargs)
         if not isinstance(result, dict):
             return json.dumps({
-                "success": False, "image": None,
-                "error": "Provider returned non-dict", "error_type": "contract",
+                "success": False,
+                "image": None,
+                "error": "Provider returned non-dict",
+                "error_type": "contract",
             })
         return json.dumps(result)
     except Exception as exc:
         logger.error("Custom image_generate handler failed", exc_info=True)
         return json.dumps({
-            "success": False, "image": None,
-            "error": f"Generation failed: {exc}", "error_type": "handler_error",
+            "success": False,
+            "image": None,
+            "error": f"Generation failed: {exc}",
+            "error_type": "handler_error",
         })
+
+
+def _handle_custom_status(args: Dict[str, Any], **kw: Any) -> str:
+    """Handler for image_status tool."""
+    job_id = args.get("job_id", "")
+    if not job_id or not isinstance(job_id, str) or not job_id.strip():
+        return json.dumps({
+            "success": False,
+            "error": "job_id is required",
+            "error_type": "missing_param",
+        })
+    job_id = job_id.strip()
+    job = _JOBS.get(job_id)
+    if not job:
+        return json.dumps({
+            "success": False,
+            "job_id": job_id,
+            "status": "not_found",
+            "error": f"No job found with ID {job_id}",
+            "error_type": "not_found",
+        })
+
+    resp: Dict[str, Any] = {
+        "success": job.get("status") != "error",
+        "job_id": job_id,
+        "status": job.get("status", "unknown"),
+        "prompt": job.get("prompt"),
+        "model": job.get("model"),
+    }
+    if job.get("path"):
+        resp["image"] = job["path"]
+        resp["path"] = job["path"]
+    if job.get("seed"):
+        resp["seed"] = job["seed"]
+    if job.get("size"):
+        resp["size"] = job["size"]
+    if job.get("error"):
+        resp["error"] = job["error"]
+        resp["error_type"] = job.get("error_type", "generation_error")
+    if "wait_time" in job:
+        resp["wait_time"] = job["wait_time"]
+    if "queue_position" in job:
+        resp["queue_position"] = job["queue_position"]
+
+    return json.dumps(resp)
 
 
 def register(ctx) -> None:
     """Register provider and replace stock image_generate with our enhanced tool."""
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx
+
     # 1. Register the provider
     ctx.register_image_gen_provider(HordeImageGenProvider())
     logger.info("Horde image gen provider registered")
@@ -1374,6 +1819,17 @@ def register(ctx) -> None:
         description=CUSTOM_TOOL_SCHEMA["description"],
     )
     logger.info("Custom image_generate tool registered")
+
+    # 4. Register image_status tool
+    ctx.register_tool(
+        name="image_status",
+        toolset="image_gen",
+        schema=IMAGE_STATUS_TOOL_SCHEMA,
+        handler=_handle_custom_status,
+        emoji="🔍",
+        description=IMAGE_STATUS_TOOL_SCHEMA["description"],
+    )
+    logger.info("Custom image_status tool registered")
 
 
 def reload_plugin() -> str:

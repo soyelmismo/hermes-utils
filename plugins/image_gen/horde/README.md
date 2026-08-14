@@ -53,6 +53,39 @@ hermes config set image_gen.horde.model "sdxl:1.0"
 | `image_gen.horde.api_key` | — | API key (alternative to `HORDE_API_KEY` env var) |
 | `HORDE_API_KEY` | (anonymous) | Env var — checked first, overrides config |
 
+## Async mode
+
+`image_generate` accepts `async: true`. In async mode the plugin submits the job and returns immediately with a `job_id` — the agent is **not** blocked during generation:
+
+```json
+{"success": true, "status": "queued", "job_id": "…", "async": true}
+```
+
+The agent can poll progress with the companion `image_status(job_id="…")` tool, and the image is delivered to the session when ready.
+
+Async delivery depends on **gateway injection**, which requires an explicit grant in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  entries:
+    horde:
+      allow_gateway_injection: true
+```
+
+Without this grant, `ctx.inject_message` returns `False` in gateway mode and the async image is never delivered to the chat (CLI mode works without the grant — it injects via `_pending_input`). If the `image_gen.horde.session_key` config or the last session key is missing, delivery falls back to the most recent session.
+
+Set it with:
+
+```bash
+hermes config set plugins.entries.horde.allow_gateway_injection true
+```
+
+### Async delivery caveat
+
+The background task currently delivers the completed image as an injected user message containing a `MEDIA:<path>` tag. That tag reaches the LLM as input; whether the user actually receives the image depends on the model repeating the tag in its reply (the gateway's auto-append only processes `MEDIA:` from `image_generate` tool results). This is non-deterministic.
+
+The deterministic fix (proposed, not yet implemented): add a `job_id` parameter to `_handle_custom_generate` that returns the cached image path without regenerating when the job is `done`, and have `_wait_and_deliver` call `ctx.dispatch_tool("image_generate", {"job_id": …})` on completion — producing a real tool result that the gateway's auto-append handles.
+
 ## Censorship handling
 
 AI Horde workers can refuse to return a generated image when their post-generation NSFW detector trips. The worker signals this in the response by setting `state: "censored"` on the generation object (and replaces the image with a censored PNG).
