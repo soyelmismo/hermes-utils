@@ -42,7 +42,7 @@ def _clear_current_environment() -> None:
     """Close and remove the cached environment so the next call creates a new one."""
     task_id = _get_task_id()
     try:
-        from tools.terminal_tool import cleanup_vm
+        from tools.terminal_tool_lifecycle import cleanup_vm
         thread = threading.Thread(target=cleanup_vm, args=(task_id,), daemon=True)
         thread.start()
         thread.join(timeout=_CLEANUP_TIMEOUT)
