@@ -128,6 +128,19 @@ class OpenProxyRotator:
         if self._last_switched_id is not None:
             return self._last_switched_id
 
+        # Try reading state file
+        for base in (Path.home(), Path("/root")):
+            state_file = base / ".gemini" / "antigravity-cli" / "active_account.json"
+            if state_file.is_file():
+                try:
+                    state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                    aid = state_data.get("account_id")
+                    if aid is not None:
+                        self._last_switched_id = int(aid)
+                        return self._last_switched_id
+                except Exception:
+                    pass
+
         # Try matching active email from google_accounts.json
         for base in (Path.home(), Path("/root")):
             accounts_file = base / ".gemini" / "google_accounts.json"
@@ -157,9 +170,26 @@ class OpenProxyRotator:
         res = self._call("POST", f"/accounts/{account_id}/apply-local-cli")
         self._last_switched_id = account_id
 
+        # Persist active state
+        for base in (Path.home(), Path("/root")):
+            state_file = base / ".gemini" / "antigravity-cli" / "active_account.json"
+            try:
+                state_file.parent.mkdir(parents=True, exist_ok=True)
+                state_file.write_text(
+                    json.dumps({
+                        "account_id": account_id,
+                        "switched_at": datetime.now(timezone.utc).isoformat(),
+                    }),
+                    encoding="utf-8",
+                )
+                break
+            except Exception:
+                pass
+
         # Sync any non-symlinked isolated workspace tokens
         self._sync_isolated_workspace_tokens()
         return res
+
 
     def _sync_isolated_workspace_tokens(self) -> None:
         """Propagate updated token to existing isolated workspace homes if not symlinked."""
