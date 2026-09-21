@@ -1,0 +1,12 @@
+name: antigravity-rotator
+kind: backend
+description: "Automatic Google Antigravity account rotation and quota telemetry via OpenProxy — seamless credential swap on rate limits without modifying the provider."
+version: 1.0.0
+author: Hermeona (soyelmismo's agent)
+repository: https://github.com/soyelmismo/hermes-utils
+hooks:
+  - transform_api_error_classification
+tools:
+  - antigravity_list_accounts
+  - antigravity_switch_account
+  - antigravity_refresh_quotas

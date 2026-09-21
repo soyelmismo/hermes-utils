@@ -21,6 +21,7 @@ Every plugin includes:
 |--------|----------|--------------|--------|
 | [ssh-router](plugins/ssh-router/) | Terminal | Dynamically switch Hermes between local and remote SSH targets at runtime — connect to any device on demand | ✅ Stable |
 | [horde](plugins/image_gen/horde/) | Image generation | Generate images via the [AI Horde](https://aihorde.net) distributed inference cluster — 50+ models (Flux, SDXL, Pony, SD15) | ✅ Stable |
+| [antigravity-rotator](plugins/antigravity-rotator/) | Model Provider Utility | Automated account failover and quota telemetry for Antigravity via OpenProxy without modifying the provider | ✅ Stable |
 
 ## Quick start
 
