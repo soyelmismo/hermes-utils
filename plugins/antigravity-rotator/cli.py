@@ -53,13 +53,18 @@ def handle_cli(args: argparse.Namespace) -> int:
     if action == "switch":
         target_id = getattr(args, "account_id", None)
         if target_id is not None:
-            res = rotator.apply_account(target_id)
-            if res.get("success"):
+            try:
+                rotator.apply_account(target_id)
                 print(f"✅ Successfully switched agy CLI to account [{target_id}].")
-            else:
-                print(f"❌ Failed to switch to account [{target_id}]: {res}")
+            except RuntimeError as exc:
+                print(f"❌ Failed to switch to account [{target_id}]: {exc}")
+                return 1
         else:
-            _, msg = rotator.rotate_to_next_account()
+            try:
+                _, msg = rotator.rotate_to_next_account()
+            except RuntimeError as exc:
+                print(f"❌ {exc}")
+                return 1
             print(f"🔄 {msg}")
         return 0
 

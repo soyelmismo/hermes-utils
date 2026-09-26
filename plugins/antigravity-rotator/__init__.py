@@ -8,6 +8,7 @@ OpenProxy without altering or polluting the provider plugin.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 try:
@@ -34,15 +35,18 @@ _QUOTA_ERROR_PATTERNS = (
     "resource exhausted",
     "quota exceeded",
     "quota_exceeded",
+    "quota reached",
+    "individual quota",
     "exhausted your capacity",
     "exceeded your current quota",
     "capacity exhausted",
     "rate limit",
     "ratelimit",
-    "429",
     "too many requests",
     "out of quota",
 )
+# "429" as a standalone token only (avoid matching sizes/IDs like 4290)
+_QUOTA_STATUS_CODE_PATTERN = re.compile(r"\b429\b")
 
 
 def _is_antigravity_provider(provider: str | None) -> bool:
@@ -62,7 +66,9 @@ def _is_quota_error(error_message: str | None, error: Exception | None = None) -
         haystack.append(str(error).lower())
         haystack.append(type(error).__name__.lower())
     full_text = " ".join(haystack)
-    return any(pat in full_text for pat in _QUOTA_ERROR_PATTERNS)
+    if any(pat in full_text for pat in _QUOTA_ERROR_PATTERNS):
+        return True
+    return _QUOTA_STATUS_CODE_PATTERN.search(full_text) is not None
 
 
 def register(ctx: Any) -> None:
@@ -142,11 +148,15 @@ def register(ctx: Any) -> None:
     # ── Tool: antigravity_switch_account ─────────────────────────────────────
     def _handle_switch_account(account_id: int | None = None) -> str:
         if account_id is not None:
-            res = rotator.apply_account(account_id)
-            if res.get("success"):
-                return f"Successfully switched agy CLI to account [{account_id}]."
-            return f"Failed to switch to account [{account_id}]: {res}"
-        _, msg = rotator.rotate_to_next_account()
+            try:
+                rotator.apply_account(account_id)
+            except RuntimeError as exc:
+                return f"Failed to switch to account [{account_id}]: {exc}"
+            return f"Successfully switched agy CLI to account [{account_id}]."
+        try:
+            _, msg = rotator.rotate_to_next_account()
+        except RuntimeError as exc:
+            return str(exc)
         return msg
 
     ctx.register_tool(
