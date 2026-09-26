@@ -23,7 +23,7 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://localhost:8787/admin/api"
-DEFAULT_TOKEN = "op_live_REDACTED"
+DEFAULT_TOKEN: str | None = None  # Never hardcode a live admin token; see OPENPROXY_ADMIN_TOKEN
 SWITCH_SCRIPT_PATH = Path("/root/switch_account.sh")
 
 # OAuth token file names used by the agy CLI (current first, legacy fallback),
@@ -95,17 +95,18 @@ class OpenProxyRotator:
             or script_url
             or DEFAULT_API_URL
         ).rstrip("/")
-        self.token = (
-            token
-            or os.getenv("OPENPROXY_ADMIN_TOKEN")
-            or script_token
-            or DEFAULT_TOKEN
-        ).strip()
+        resolved_token = token or os.getenv("OPENPROXY_ADMIN_TOKEN") or script_token or DEFAULT_TOKEN
+        self.token = resolved_token.strip() if resolved_token else None
         self.quota_threshold_percent = quota_threshold_percent
         self._last_switched_id: int | None = None
 
     def _call(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
         """Call OpenProxy admin API endpoint."""
+        if not self.token:
+            raise RuntimeError(
+                "OpenProxy admin token not configured (config openproxy_token, "
+                "env OPENPROXY_ADMIN_TOKEN, or /root/switch_account.sh)."
+            )
         url = f"{self.api_url}{path}"
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -291,21 +292,27 @@ class OpenProxyRotator:
                     earliest_reset_acc = a
         return earliest_reset_acc
 
-    def find_best_candidate(
+    @staticmethod
+    def _is_rate_limited(account: dict[str, Any]) -> bool:
+        """True while OpenProxy benches this account as rate-limited."""
+        limited_until = account.get("rate_limited_until")
+        if not limited_until:
+            return False
+        try:
+            dt = datetime.fromisoformat(str(limited_until).replace("Z", "+00:00"))
+            return dt > datetime.now(timezone.utc)
+        except Exception:
+            return False
+
+    def find_best_candidates(
         self,
         exclude_id: int | None = None,
         allow_exhausted: bool = False,
-    ) -> dict[str, Any] | None:
-        """Find the account with the most remaining quota capacity.
-
-        Only accounts with usable quota are considered. When none qualify,
-        the account with the earliest session reset is returned only if
-        ``allow_exhausted`` is True (otherwise None, so callers can abort
-        instead of switching to an exhausted account).
-        """
+    ) -> list[dict[str, Any]]:
+        """Return every usable account, best first (see find_best_candidate)."""
         accounts = self.list_accounts()
         if not accounts:
-            return None
+            return []
 
         current_id = exclude_id if exclude_id is not None else self.get_active_account_id()
 
@@ -313,6 +320,8 @@ class OpenProxyRotator:
         for a in accounts:
             aid = a.get("id")
             if current_id is not None and aid == current_id and len(accounts) > 1:
+                continue
+            if self._is_rate_limited(a):
                 continue
             if not self._has_remaining_quota(a):
                 continue
@@ -324,34 +333,84 @@ class OpenProxyRotator:
             # Sort: highest remaining session, then highest remaining weekly,
             # then lowest session used
             candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-            return candidates[0][3]
+            return [item[3] for item in candidates]
 
         # If all candidates exhausted, find account with earliest session reset
         if allow_exhausted:
-            return self._earliest_reset_account(accounts)
-        return None
+            fallback = self._earliest_reset_account(accounts)
+            if fallback is not None:
+                return [fallback]
+        return []
+
+    def find_best_candidate(
+        self,
+        exclude_id: int | None = None,
+        allow_exhausted: bool = False,
+    ) -> dict[str, Any] | None:
+        """Find the account with the most remaining quota capacity.
+
+        Only accounts with usable quota (and not rate-limited by OpenProxy)
+        are considered. When none qualify, the account with the earliest
+        session reset is returned only if ``allow_exhausted`` is True
+        (otherwise None, so callers can abort instead of switching to an
+        exhausted account).
+        """
+        candidates = self.find_best_candidates(
+            exclude_id=exclude_id, allow_exhausted=allow_exhausted
+        )
+        return candidates[0] if candidates else None
+
+    def _refresh_and_still_usable(self, account: dict[str, Any]) -> dict[str, Any] | None:
+        """Pull live quota for a candidate; None if it turned out unusable.
+
+        A refresh that fails (network/telemetry hiccup) is not fatal: rotation
+        proceeds with the cached data rather than blocking on telemetry.
+        """
+        aid = account.get("id")
+        refresh = self.refresh_quota(aid)
+        if not isinstance(refresh, dict) or "error" in refresh:
+            return account
+        merged = {**account, **refresh}
+        if self._is_rate_limited(merged) or not self._has_remaining_quota(merged):
+            logger.info(
+                "[antigravity-rotator] Skipping account [%s]: still rate-limited/exhausted after quota refresh",
+                aid,
+            )
+            return None
+        return merged
 
     def rotate_to_next_account(self, current_account_id: int | None = None) -> tuple[dict[str, Any], str]:
-        """Select best candidate, inject into agy CLI, and return account + description."""
+        """Select best candidate, verify it is not rate-limited, inject into agy CLI.
+
+        Walks candidates best-first; for each one the live quota is refreshed
+        and the account is skipped if OpenProxy now reports it rate-limited or
+        exhausted, so rotation never lands on another dead account.
+        """
         active_id = current_account_id if current_account_id is not None else self.get_active_account_id()
-        best = self.find_best_candidate(exclude_id=active_id)
-        if best is None:
+        candidates = self.find_best_candidates(exclude_id=active_id)
+        if not candidates:
             self._raise_no_usable_account(active_id)
 
-        best_id = best.get("id")
-        email = best.get("email") or best.get("label") or f"account-{best_id}"
-        sess_used = best.get("quota_session_used") or 0
-        sess_lim = best.get("quota_session_limit") or 1000
-        reset_time = format_remaining_time(best.get("quota_session_reset_at"))
+        for cand in candidates:
+            best = self._refresh_and_still_usable(cand)
+            if best is None:
+                continue
+            best_id = best.get("id")
+            email = best.get("email") or best.get("label") or f"account-{best_id}"
+            sess_used = best.get("quota_session_used") or 0
+            sess_lim = best.get("quota_session_limit") or 1000
+            reset_time = format_remaining_time(best.get("quota_session_reset_at"))
 
-        self.apply_account(best_id)
+            self.apply_account(best_id)
 
-        msg = (
-            f"Rotated Antigravity account to [{best_id}] {email} "
-            f"(session: {sess_used}/{sess_lim}, reset: {reset_time})"
-        )
-        logger.info("[antigravity-rotator] %s", msg)
-        return best, msg
+            msg = (
+                f"Rotated Antigravity account to [{best_id}] {email} "
+                f"(session: {sess_used}/{sess_lim}, reset: {reset_time})"
+            )
+            logger.info("[antigravity-rotator] %s", msg)
+            return best, msg
+
+        self._raise_no_usable_account(active_id)
 
     def _raise_no_usable_account(self, exclude_id: int | None) -> NoReturn:
         """Raise RuntimeError describing why no account could be selected."""

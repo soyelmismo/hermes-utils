@@ -472,3 +472,63 @@ def test_sync_isolated_workspace_tokens_noop_without_token(tmp_path, monkeypatch
 
     # No real token available → nothing is touched
     assert (stale / "jetski-standalone-oauth-token").read_text(encoding="utf-8") == "OLD"
+
+
+def _mk_account(aid, sess_used=0, sess_lim=1000, wk_used=0, wk_lim=1000, **kw):
+    acc = {
+        "id": aid,
+        "provider_id": "antigravity",
+        "email": f"a{aid}@example.com",
+        "quota_session_used": sess_used,
+        "quota_session_limit": sess_lim,
+        "quota_weekly_used": wk_used,
+        "quota_weekly_limit": wk_lim,
+    }
+    acc.update(kw)
+    return acc
+
+
+def test_rate_limited_until_future_is_skipped():
+    from datetime import datetime, timedelta, timezone
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    accounts = [
+        _mk_account(1, rate_limited_until=future),   # benched → must be skipped
+        _mk_account(2, quota_session_used=500, rate_limited_until=past),  # expired bench → usable
+    ]
+    with patch.object(rotator, "list_accounts", return_value=accounts):
+        best = rotator.find_best_candidate(exclude_id=None)
+        assert best is not None and best["id"] == 2
+
+
+def test_rotate_skips_candidate_still_exhausted_after_refresh():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [_mk_account(1, sess_used=10), _mk_account(2, sess_used=900)]
+    with (
+        patch.object(rotator, "list_accounts", return_value=accounts),
+        patch.object(rotator, "refresh_quota") as m_refresh,
+        patch.object(rotator, "apply_account") as m_apply,
+    ):
+        # Account 1 was the best by cached data, but live refresh says full
+        m_refresh.side_effect = lambda aid: (
+            {"quota_session_used": 1000, "quota_session_limit": 1000} if aid == 1 else {}
+        )
+        m_apply.return_value = {"success": True}
+        best, msg = rotator.rotate_to_next_account(current_account_id=99)
+        assert best["id"] == 2
+        m_apply.assert_called_once_with(2)
+        assert "[2]" in msg
+
+
+def test_rotate_refresh_failure_proceeds_with_cached_data():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [_mk_account(1, sess_used=10)]
+    with (
+        patch.object(rotator, "list_accounts", return_value=accounts),
+        patch.object(rotator, "refresh_quota", return_value={"error": "boom"}),
+        patch.object(rotator, "apply_account", return_value={"success": True}) as m_apply,
+    ):
+        best, _ = rotator.rotate_to_next_account(current_account_id=99)
+        assert best["id"] == 1
+        m_apply.assert_called_once_with(1)

@@ -32,7 +32,7 @@ In `~/.hermes/config.yaml`:
 plugins:
   antigravity-rotator:
     openproxy_url: "http://localhost:8787/admin/api"
-    openproxy_token: "op_live_REDACTED"
+    openproxy_token: "op_live_YOUR_TOKEN_HERE"   # or set env OPENPROXY_ADMIN_TOKEN
     auto_rotate: true
     quota_threshold_percent: 95.0
 ```
