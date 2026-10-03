@@ -33,7 +33,7 @@ plugins:
   antigravity-rotator:
     backend: "auto"              # "auto", "openproxy", or "local"
     openproxy_url: "http://localhost:8787/admin/api"
-    openproxy_token: "op_live_YOUR_TOKEN_HERE"   # or set env OPENPROXY_ADMIN_TOKEN
+    openproxy_token: "<openproxy-admin-token>"   # or set env OPENPROXY_ADMIN_TOKEN
     auto_rotate: true
     quota_threshold_percent: 95.0
     cooldown_minutes: 15
