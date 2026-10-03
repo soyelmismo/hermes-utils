@@ -1,8 +1,8 @@
-"""OpenProxy client and Antigravity account rotation engine.
+"""Selection engine and account rotators for Antigravity.
 
-Communicates with OpenProxy's admin API to track 5-hour session quotas,
-weekly quotas, refresh telemetry, and inject OAuth credentials directly
-into the local agy CLI environment.
+Coordinates quota evaluation across Gemini and Claude/GPT pools,
+evaluates account usability gates, ranks candidates, and drives
+credential switching across OpenProxy and local file backends.
 """
 
 from __future__ import annotations
@@ -11,48 +11,44 @@ import contextlib
 import json
 import logging
 import os
-import re
 import shutil
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
-import urllib.error
+from typing import Any, NoReturn, Optional
 import urllib.request
+
+try:
+    from .backend_local import LocalBackend
+    from .backend_openproxy import (
+        DEFAULT_API_URL, _config_bases, _read_credentials_from_script,
+        get_switch_script_candidates, resolve_openproxy_credentials, resolve_switch_script_path,
+    )
+    from .constants import (
+        DEFAULT_SWITCH_SCRIPT_PATH, ISOLATED_HOME_GLOBS, ISOLATED_TMP_ROOT, TOKEN_FILENAMES,
+    )
+    from .quota import (
+        calculate_score, is_usable_for_pool, pool_for_model, pools_from_openproxy,
+    )
+except ImportError:
+    from backend_local import LocalBackend
+    from backend_openproxy import (
+        DEFAULT_API_URL, _config_bases, _read_credentials_from_script,
+        get_switch_script_candidates, resolve_openproxy_credentials, resolve_switch_script_path,
+    )
+    from constants import (
+        DEFAULT_SWITCH_SCRIPT_PATH, ISOLATED_HOME_GLOBS, ISOLATED_TMP_ROOT, TOKEN_FILENAMES,
+    )
+    from quota import (
+        calculate_score, is_usable_for_pool, pool_for_model, pools_from_openproxy,
+    )
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "http://localhost:8787/admin/api"
-DEFAULT_TOKEN: str | None = None  # Never hardcode a live admin token; see OPENPROXY_ADMIN_TOKEN
-SWITCH_SCRIPT_PATH = Path("/root/switch_account.sh")
-
-# OAuth token file names used by the agy CLI (current first, legacy fallback),
-# mirroring the antigravity-subscription-directsdk provider.
-_TOKEN_FILENAMES = ("jetski-standalone-oauth-token", "antigravity-oauth-token")
-# Isolated workspace homes created by the directsdk provider live under /tmp.
-_ISOLATED_TMP_ROOT = Path("/tmp")
-_ISOLATED_HOME_GLOBS = ("agy_*", "hermes_agy_*")
-
-
-def _config_bases() -> tuple[Path, ...]:
-    """Directories searched for agy CLI state (primary home first, /root as fallback)."""
-    return (Path.home(), Path("/root"))
-
-
-def _read_credentials_from_script(script_path: Path = SWITCH_SCRIPT_PATH) -> tuple[str | None, str | None]:
-    """Extract API_URL and TOKEN from switch_account.sh if present."""
-    if not script_path.is_file():
-        return None, None
-    try:
-        content = script_path.read_text(encoding="utf-8")
-        url_match = re.search(r'API_URL=["\']([^"\']+)["\']', content)
-        token_match = re.search(r'TOKEN=["\']([^"\']+)["\']', content)
-        url = url_match.group(1).strip() if url_match else None
-        token = token_match.group(1).strip() if token_match else None
-        return url, token
-    except Exception as exc:
-        logger.debug("Failed to parse switch script %s: %s", script_path, exc)
-        return None, None
+DEFAULT_TOKEN: str | None = None
+SWITCH_SCRIPT_PATH = DEFAULT_SWITCH_SCRIPT_PATH
+_TOKEN_FILENAMES = TOKEN_FILENAMES
+_ISOLATED_TMP_ROOT = ISOLATED_TMP_ROOT
+_ISOLATED_HOME_GLOBS = ISOLATED_HOME_GLOBS
 
 
 def format_remaining_time(iso_str: str | None) -> str:
@@ -60,14 +56,12 @@ def format_remaining_time(iso_str: str | None) -> str:
     if not iso_str or iso_str == "N/A":
         return "N/A"
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        diff = (dt - now).total_seconds()
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        diff = (dt - datetime.now(timezone.utc)).total_seconds()
         if diff <= 0:
             return "ready"
-        d = int(diff // 86400)
-        h = int((diff % 86400) // 3600)
-        m = int((diff % 3600) // 60)
+        d, rem = divmod(int(diff), 86400)
+        h, m = divmod(rem // 60, 60)
         parts = []
         if d > 0:
             parts.append(f"{d}d")
@@ -80,135 +74,109 @@ def format_remaining_time(iso_str: str | None) -> str:
 
 
 class OpenProxyRotator:
-    """Manages Antigravity accounts and performs automated credential rotation."""
+    """OpenProxy account rotator and common selection engine."""
 
     def __init__(
         self,
         api_url: str | None = None,
         token: str | None = None,
         quota_threshold_percent: float = 95.0,
+        cooldown_minutes: int = 15,
+        script_path: Path | str | None = None,
     ) -> None:
-        script_url, script_token = _read_credentials_from_script()
-        self.api_url = (
-            api_url
-            or os.getenv("OPENPROXY_ADMIN_URL")
-            or script_url
-            or DEFAULT_API_URL
-        ).rstrip("/")
-        resolved_token = token or os.getenv("OPENPROXY_ADMIN_TOKEN") or script_token or DEFAULT_TOKEN
-        self.token = resolved_token.strip() if resolved_token else None
+        self.api_url, self.token = resolve_openproxy_credentials(
+            config_url=api_url,
+            config_token=token,
+            script_path=script_path,
+        )
         self.quota_threshold_percent = quota_threshold_percent
-        self._last_switched_id: int | None = None
+        self.cooldown_minutes = cooldown_minutes
+        self._last_switched_id: int | str | None = None
 
     def _call(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
-        """Call OpenProxy admin API endpoint."""
         if not self.token:
             raise RuntimeError(
                 "OpenProxy admin token not configured (config openproxy_token, "
-                "env OPENPROXY_ADMIN_TOKEN, or /root/switch_account.sh)."
+                "env OPENPROXY_ADMIN_TOKEN, env SWITCH_ACCOUNT_TOKEN, or switch_account.sh script)."
             )
-        url = f"{self.api_url}{path}"
         headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
-            "User-Agent": "hermes-antigravity-rotator/1.0",
+            "User-Agent": "hermes-antigravity-rotator/1.1",
         }
         body = json.dumps(data).encode("utf-8") if data is not None else None
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        req = urllib.request.Request(f"{self.api_url}{path}", data=body, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw.strip() else {}
 
     def list_accounts(self, mark_active: bool = True) -> list[dict[str, Any]]:
-        """Fetch and return all antigravity provider accounts.
-
-        When ``mark_active`` is True the active account ID is resolved to flag
-        ``is_active``; callers that run *from* that resolution pass False to
-        avoid infinite recursion.
-        """
         try:
             data = self._call("GET", "/accounts")
             if not isinstance(data, list):
-                logger.warning("OpenProxy /accounts returned non-list: %s", data)
                 return []
             accounts = [a for a in data if a.get("provider_id") == "antigravity"]
-            # Mark active status if known
             active_id = self.get_active_account_id() if mark_active else None
             for a in accounts:
                 a["is_active"] = (a.get("id") == active_id)
+                if "pools" not in a:
+                    a["pools"] = pools_from_openproxy(a)
             return accounts
         except Exception as exc:
             logger.error("Failed to list accounts from OpenProxy (%s): %s", self.api_url, exc)
             return []
 
-    def get_active_account_id(self) -> int | None:
-        """Return the ID of the currently active account if known."""
+    def get_active_account_id(self) -> Any:
         if self._last_switched_id is not None:
             return self._last_switched_id
-
-        # Try reading state file
         for base in _config_bases():
-            state_file = base / ".gemini" / "antigravity-cli" / "active_account.json"
-            if state_file.is_file():
+            sf = base / ".gemini" / "antigravity-cli" / "active_account.json"
+            if sf.is_file():
                 try:
-                    state_data = json.loads(state_file.read_text(encoding="utf-8"))
-                    aid = state_data.get("account_id")
+                    aid = json.loads(sf.read_text(encoding="utf-8")).get("account_id")
                     if aid is not None:
-                        self._last_switched_id = int(aid)
+                        self._last_switched_id = int(aid) if str(aid).isdigit() else aid
                         return self._last_switched_id
                 except Exception:
                     pass
-
-        # Try matching active email from google_accounts.json
         for base in _config_bases():
-            accounts_file = base / ".gemini" / "google_accounts.json"
-            if accounts_file.is_file():
+            af = base / ".gemini" / "google_accounts.json"
+            if af.is_file():
                 try:
-                    data = json.loads(accounts_file.read_text(encoding="utf-8"))
-                    active_email = data.get("active")
-                    if active_email:
+                    act = json.loads(af.read_text(encoding="utf-8")).get("active")
+                    if act:
                         for acc in self.list_accounts(mark_active=False):
-                            if acc.get("email") == active_email or acc.get("label") == active_email:
-                                self._last_switched_id = acc.get("id")
+                            if acc.get("email") == act or acc.get("label") == act:
+                                aid = acc.get("id")
+                                self._last_switched_id = int(aid) if str(aid).isdigit() else aid
                                 return self._last_switched_id
                 except Exception:
                     pass
         return None
 
-    def refresh_quota(self, account_id: int) -> dict[str, Any]:
-        """Request live quota telemetry refresh for an account."""
+    def refresh_quota(self, account_id: Any) -> dict[str, Any]:
         try:
             return self._call("POST", f"/accounts/{account_id}/refresh-quota")
         except Exception as exc:
-            logger.warning("Failed to refresh quota for account %s: %s", account_id, exc)
             return {"error": str(exc)}
 
-    def apply_account(self, account_id: int) -> dict[str, Any]:
-        """Apply account credentials to local agy CLI configuration.
-
-        Raises RuntimeError when OpenProxy reports failure, so callers never
-        record a switch that did not happen.
-        """
+    def apply_account(self, account_id: Any) -> dict[str, Any]:
         res = self._call("POST", f"/accounts/{account_id}/apply-local-cli")
         if isinstance(res, dict) and not res.get("success"):
             raise RuntimeError(f"OpenProxy failed to apply account [{account_id}]: {res}")
-
-        self._last_switched_id = account_id
-        self._persist_active_state(account_id)
+        aid = int(account_id) if str(account_id).isdigit() else account_id
+        self._last_switched_id = aid
+        self._persist_active_state(aid)
         self._sync_isolated_workspace_tokens()
         return res
 
-    def _persist_active_state(self, account_id: int) -> None:
-        """Write active_account.json so the active account survives restarts."""
+    def _persist_active_state(self, account_id: Any) -> None:
         for base in _config_bases():
-            state_file = base / ".gemini" / "antigravity-cli" / "active_account.json"
+            sf = base / ".gemini" / "antigravity-cli" / "active_account.json"
             try:
-                state_file.parent.mkdir(parents=True, exist_ok=True)
-                state_file.write_text(
-                    json.dumps({
-                        "account_id": account_id,
-                        "switched_at": datetime.now(timezone.utc).isoformat(),
-                    }),
+                sf.parent.mkdir(parents=True, exist_ok=True)
+                sf.write_text(
+                    json.dumps({"account_id": account_id, "switched_at": datetime.now(timezone.utc).isoformat()}),
                     encoding="utf-8",
                 )
                 break
@@ -216,234 +184,298 @@ class OpenProxyRotator:
                 pass
 
     def _resolve_real_token(self) -> Path | None:
-        """Locate the live OAuth token file, current name first."""
         for base in _config_bases():
-            token_dir = base / ".gemini" / "antigravity-cli"
-            for name in _TOKEN_FILENAMES:
-                candidate = token_dir / name
-                if candidate.is_file():
-                    return candidate
+            td = base / ".gemini" / "antigravity-cli"
+            for name in TOKEN_FILENAMES:
+                if (td / name).is_file():
+                    return td / name
         return None
 
     def _sync_isolated_workspace_tokens(self, tmp_root: Path | None = None) -> None:
-        """Propagate updated token to existing isolated workspace homes if not symlinked."""
-        real_token = self._resolve_real_token()
-        if real_token is None:
+        rt = self._resolve_real_token()
+        if not rt:
             return
+        for pattern in ISOLATED_HOME_GLOBS:
+            for ad in (tmp_root or ISOLATED_TMP_ROOT).glob(pattern):
+                td = ad / "home" / ".gemini" / "antigravity-cli"
+                for name in TOKEN_FILENAMES:
+                    it = td / name
+                    if it.is_file() and not it.is_symlink():
+                        with contextlib.suppress(Exception):
+                            shutil.copy2(rt, it)
 
-        # Check /tmp for active agy_* / hermes_agy_* isolated workspace homes
-        tmp_dir = tmp_root if tmp_root is not None else _ISOLATED_TMP_ROOT
-        try:
-            for pattern in _ISOLATED_HOME_GLOBS:
-                for agy_dir in tmp_dir.glob(pattern):
-                    self._sync_isolated_home(agy_dir, real_token)
-        except Exception as exc:
-            logger.debug("Isolated token sync ignored: %s", exc)
-
-    def _sync_isolated_home(self, agy_dir: Path, real_token: Path) -> None:
-        """Copy the real token into one isolated home, skipping symlinked entries."""
-        token_dir = agy_dir / "home" / ".gemini" / "antigravity-cli"
-        for name in _TOKEN_FILENAMES:
-            isolated_token = token_dir / name
-            if isolated_token.is_file() and not isolated_token.is_symlink():
-                with contextlib.suppress(Exception):
-                    shutil.copy2(real_token, isolated_token)
-
-    def _has_remaining_quota(self, account: dict[str, Any]) -> bool:
-        """Check whether an account still has usable session and weekly quota."""
-        sess_used = account.get("quota_session_used") or 0
-        sess_limit = account.get("quota_session_limit") or 1000
-        weekly_used = account.get("quota_weekly_used") or 0
-        weekly_limit = account.get("quota_weekly_limit") or 1000
-
-        threshold_ratio = self.quota_threshold_percent / 100.0
-        if sess_limit > 0:
-            if sess_used >= sess_limit:
-                return False
-            if (sess_used / sess_limit) >= threshold_ratio:
-                return False
-        if weekly_limit > 0 and weekly_used >= weekly_limit:
-            return False
-        return True
+    def _has_remaining_quota(self, account: dict[str, Any], pool_key: str = "gemini") -> bool:
+        pools = account.get("pools") or pools_from_openproxy(account)
+        return is_usable_for_pool(pools, pool_key, self.quota_threshold_percent)
 
     @staticmethod
     def _quota_remaining(account: dict[str, Any]) -> tuple[int, int, int]:
-        """Return (remaining session, remaining weekly, session used) for ranking."""
-        sess_used = account.get("quota_session_used") or 0
-        sess_limit = account.get("quota_session_limit") or 1000
-        weekly_used = account.get("quota_weekly_used") or 0
-        weekly_limit = account.get("quota_weekly_limit") or 1000
-        return (
-            max(0, sess_limit - sess_used),
-            max(0, weekly_limit - weekly_used),
-            sess_used,
-        )
+        su, sl = account.get("quota_session_used") or 0, account.get("quota_session_limit") or 1000
+        wu, wl = account.get("quota_weekly_used") or 0, account.get("quota_weekly_limit") or 1000
+        return (max(0, sl - su), max(0, wl - wu), su)
 
-    @staticmethod
-    def _earliest_reset_account(accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """Return the account whose 5-hour session resets soonest."""
-        earliest_reset_acc = None
-        earliest_ts = None
+    def _earliest_reset_account(self, accounts: list[dict[str, Any]], pool_key: str = "gemini") -> dict[str, Any] | None:
+        earliest_acc, earliest_ts = None, None
         for a in accounts:
-            reset_at = a.get("quota_session_reset_at")
-            if reset_at:
-                if earliest_ts is None or reset_at < earliest_ts:
-                    earliest_ts = reset_at
-                    earliest_reset_acc = a
-        return earliest_reset_acc
+            pools = a.get("pools") or pools_from_openproxy(a)
+            reset_at = pools.get(pool_key, {}).get("5h", {}).get("reset_at") or a.get("quota_session_reset_at")
+            if reset_at and (earliest_ts is None or str(reset_at) < earliest_ts):
+                earliest_ts, earliest_acc = str(reset_at), a
+        return earliest_acc
 
     @staticmethod
     def _is_rate_limited(account: dict[str, Any]) -> bool:
-        """True while OpenProxy benches this account as rate-limited."""
-        limited_until = account.get("rate_limited_until")
-        if not limited_until:
+        if account.get("in_cooldown"):
+            return True
+        lu = account.get("rate_limited_until") or account.get("cooldown_until")
+        if not lu:
             return False
         try:
-            dt = datetime.fromisoformat(str(limited_until).replace("Z", "+00:00"))
-            return dt > datetime.now(timezone.utc)
+            return datetime.fromisoformat(str(lu).replace("Z", "+00:00")) > datetime.now(timezone.utc)
         except Exception:
             return False
 
     def find_best_candidates(
         self,
-        exclude_id: int | None = None,
+        exclude_id: Any = None,
         allow_exhausted: bool = False,
+        model: str = "",
+        pool_key: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Return every usable account, best first (see find_best_candidate)."""
         accounts = self.list_accounts()
         if not accounts:
             return []
-
-        current_id = exclude_id if exclude_id is not None else self.get_active_account_id()
+        target_pool = pool_key or pool_for_model(model)
+        cid = exclude_id if exclude_id is not None else self.get_active_account_id()
 
         candidates = []
         for a in accounts:
             aid = a.get("id")
-            if current_id is not None and aid == current_id and len(accounts) > 1:
+            if cid is not None and str(aid) == str(cid) and len(accounts) > 1:
                 continue
             if self._is_rate_limited(a):
                 continue
-            if not self._has_remaining_quota(a):
-                continue
 
-            remaining_sess, remaining_weekly, sess_used = self._quota_remaining(a)
-            candidates.append((remaining_sess, remaining_weekly, sess_used, a))
+            # Model support check (Point 6)
+            if model and hasattr(self, "backend") and hasattr(self.backend, "list_models"):
+                models = self.backend.list_models(str(aid))
+                if not self.backend.account_supports_model(models, model):
+                    continue
+
+            pools = a.get("pools") or pools_from_openproxy(a)
+            a["pools"] = pools
+            if not is_usable_for_pool(pools, target_pool, self.quota_threshold_percent):
+                continue
+            candidates.append((calculate_score(pools, target_pool), a))
 
         if candidates:
-            # Sort: highest remaining session, then highest remaining weekly,
-            # then lowest session used
-            candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-            return [item[3] for item in candidates]
-
-        # If all candidates exhausted, find account with earliest session reset
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return [item[1] for item in candidates]
         if allow_exhausted:
-            fallback = self._earliest_reset_account(accounts)
-            if fallback is not None:
-                return [fallback]
+            fb = self._earliest_reset_account(accounts, pool_key=target_pool)
+            if fb is not None:
+                return [fb]
         return []
 
     def find_best_candidate(
         self,
-        exclude_id: int | None = None,
+        exclude_id: Any = None,
         allow_exhausted: bool = False,
+        model: str = "",
+        pool_key: Optional[str] = None,
     ) -> dict[str, Any] | None:
-        """Find the account with the most remaining quota capacity.
-
-        Only accounts with usable quota (and not rate-limited by OpenProxy)
-        are considered. When none qualify, the account with the earliest
-        session reset is returned only if ``allow_exhausted`` is True
-        (otherwise None, so callers can abort instead of switching to an
-        exhausted account).
-        """
-        candidates = self.find_best_candidates(
-            exclude_id=exclude_id, allow_exhausted=allow_exhausted
+        c = self.find_best_candidates(
+            exclude_id=exclude_id,
+            allow_exhausted=allow_exhausted,
+            model=model,
+            pool_key=pool_key,
         )
-        return candidates[0] if candidates else None
+        return c[0] if c else None
 
-    def _refresh_and_still_usable(self, account: dict[str, Any]) -> dict[str, Any] | None:
-        """Pull live quota for a candidate; None if it turned out unusable.
-
-        A refresh that fails (network/telemetry hiccup) is not fatal: rotation
-        proceeds with the cached data rather than blocking on telemetry.
-        """
+    def _refresh_and_still_usable(self, account: dict[str, Any], pool_key: str = "gemini") -> dict[str, Any] | None:
         aid = account.get("id")
         refresh = self.refresh_quota(aid)
         if not isinstance(refresh, dict) or "error" in refresh:
             return account
         merged = {**account, **refresh}
-        if self._is_rate_limited(merged) or not self._has_remaining_quota(merged):
-            logger.info(
-                "[antigravity-rotator] Skipping account [%s]: still rate-limited/exhausted after quota refresh",
-                aid,
-            )
+        if "pools" in refresh and isinstance(refresh["pools"], dict) and refresh["pools"]:
+            pools = refresh["pools"]
+        elif "pools" in merged and isinstance(merged["pools"], dict) and merged["pools"] and not any(k.startswith("quota_session_") for k in refresh):
+            pools = merged["pools"]
+        else:
+            pools = pools_from_openproxy(merged)
+        merged["pools"] = pools
+        if self._is_rate_limited(merged) or not is_usable_for_pool(pools, pool_key, self.quota_threshold_percent):
             return None
         return merged
 
-    def rotate_to_next_account(self, current_account_id: int | None = None) -> tuple[dict[str, Any], str]:
-        """Select best candidate, verify it is not rate-limited, inject into agy CLI.
+    def rotate_to_next_account(
+        self,
+        current_account_id: Any = None,
+        model: str = "",
+        quota_exhausted: bool = False,
+    ) -> tuple[dict[str, Any], str]:
+        pool_key = pool_for_model(model)
+        aid = current_account_id if current_account_id is not None else self.get_active_account_id()
 
-        Walks candidates best-first; for each one the live quota is refreshed
-        and the account is skipped if OpenProxy now reports it rate-limited or
-        exhausted, so rotation never lands on another dead account.
-        """
-        active_id = current_account_id if current_account_id is not None else self.get_active_account_id()
-        candidates = self.find_best_candidates(exclude_id=active_id)
+        if quota_exhausted and aid is not None and hasattr(self, "backend") and hasattr(self.backend, "set_cooldown"):
+            ap = None
+            for a in self.list_accounts():
+                if str(a.get("id")) == str(aid):
+                    ap = a.get("pools")
+                    break
+            self.backend.set_cooldown(str(aid), pool_key, ap, fallback_minutes=self.cooldown_minutes)
+
+        candidates = self.find_best_candidates(exclude_id=aid, model=model)
         if not candidates:
-            self._raise_no_usable_account(active_id)
+            self._raise_no_usable_account(aid, pool_key=pool_key)
 
         for cand in candidates:
-            best = self._refresh_and_still_usable(cand)
+            best = self._refresh_and_still_usable(cand, pool_key=pool_key)
             if best is None:
                 continue
-            best_id = best.get("id")
-            email = best.get("email") or best.get("label") or f"account-{best_id}"
-            sess_used = best.get("quota_session_used") or 0
-            sess_lim = best.get("quota_session_limit") or 1000
-            reset_time = format_remaining_time(best.get("quota_session_reset_at"))
-
-            self.apply_account(best_id)
-
-            msg = (
-                f"Rotated Antigravity account to [{best_id}] {email} "
-                f"(session: {sess_used}/{sess_lim}, reset: {reset_time})"
-            )
+            bid = best.get("id")
+            email = best.get("email") or best.get("label") or f"account-{bid}"
+            pools = best.get("pools") or pools_from_openproxy(best)
+            w5h = pools.get(pool_key, {}).get("5h", {})
+            f5h = w5h.get("remaining_fraction")
+            rem_5h = f"{int(f5h * 100)}%" if f5h is not None else "?"
+            rst = format_remaining_time(w5h.get("reset_at") or best.get("quota_session_reset_at"))
+            self.apply_account(bid)
+            msg = f"Rotated Antigravity account to [{bid}] {email} (pool: {pool_key}, 5h: {rem_5h}, reset: {rst})"
             logger.info("[antigravity-rotator] %s", msg)
             return best, msg
 
-        self._raise_no_usable_account(active_id)
+        self._raise_no_usable_account(aid, pool_key=pool_key)
 
-    def _raise_no_usable_account(self, exclude_id: int | None) -> NoReturn:
-        """Raise RuntimeError describing why no account could be selected."""
-        fallback = self.find_best_candidate(exclude_id=exclude_id, allow_exhausted=True)
+    def _raise_no_usable_account(self, exclude_id: Any, pool_key: str = "gemini") -> NoReturn:
+        fallback = self.find_best_candidate(exclude_id=exclude_id, allow_exhausted=True, pool_key=pool_key)
         if fallback is None:
             raise RuntimeError("No Antigravity accounts configured in OpenProxy.")
-        reset_iso = fallback.get("quota_session_reset_at") or "unknown"
-        reset_human = format_remaining_time(fallback.get("quota_session_reset_at"))
-        raise RuntimeError(
-            f"All Antigravity accounts exhausted; earliest session reset: {reset_iso} ({reset_human})"
+        pools = fallback.get("pools") or pools_from_openproxy(fallback)
+        iso = (
+            pools.get(pool_key, {}).get("5h", {}).get("reset_at")
+            or fallback.get("quota_session_reset_at")
+            or "unknown"
         )
+        raise RuntimeError(f"All Antigravity accounts exhausted; earliest session reset: {iso} ({format_remaining_time(iso)})")
 
-    def format_status_table(self) -> str:
-        """Render a formatted markdown table of all Antigravity accounts."""
+    def format_status_table(self, model: str = "") -> str:
         accounts = self.list_accounts()
+        backend_name = "Local Pool" if isinstance(self, LocalRotator) else "OpenProxy Pool"
         if not accounts:
-            return "No Antigravity accounts found in OpenProxy."
-
-        active_id = self.get_active_account_id()
+            return f"No Antigravity accounts found in {backend_name}."
+        pool_key = pool_for_model(model)
+        aid = self.get_active_account_id()
         lines = [
-            "### 🔄 Google Antigravity Accounts (OpenProxy Pool)",
+            f"### 🔄 Google Antigravity Accounts ({backend_name} - {pool_key.upper()})",
             "",
-            "| Active | ID | Account / Email | 5-Hour Session | Session Reset | Weekly Quota | Weekly Reset |",
+            "| Active | ID | Account / Email | 5-Hour Quota | Session Reset | Weekly Quota | Weekly Reset |",
             "|:---:|:---:|:---|:---:|:---:|:---:|:---:|",
         ]
         for a in accounts:
-            aid = a.get("id")
-            is_active = "👉 **ACTIVE**" if aid == active_id else ""
-            label = a.get("email") or a.get("label") or "N/A"
-            sess = f"{a.get('quota_session_used') or 0} / {a.get('quota_session_limit') or '∞'}"
-            sess_reset = format_remaining_time(a.get("quota_session_reset_at"))
-            weekly = f"{a.get('quota_weekly_used') or 0} / {a.get('quota_weekly_limit') or '∞'}"
-            weekly_reset = format_remaining_time(a.get("quota_weekly_reset_at"))
-            lines.append(f"| {is_active} | `{aid}` | {label} | {sess} | {sess_reset} | {weekly} | {weekly_reset} |")
-
+            acc_id = a.get("id")
+            act = "👉 **ACTIVE**" if str(acc_id) == str(aid) else ""
+            lbl = a.get("email") or a.get("label") or "N/A"
+            pools = a.get("pools") or pools_from_openproxy(a)
+            pool = pools.get(pool_key, {})
+            w5h = pool.get("5h", {})
+            f5h = w5h.get("remaining_fraction")
+            su = f"{int(f5h * 100)}%" if f5h is not None else f"{a.get('quota_session_used') or 0} / {a.get('quota_session_limit') or '∞'}"
+            sr = format_remaining_time(w5h.get("reset_at") or a.get("quota_session_reset_at"))
+            wwk = pool.get("weekly", {})
+            fwk = wwk.get("remaining_fraction")
+            wu = f"{int(fwk * 100)}%" if fwk is not None else f"{a.get('quota_weekly_used') or 0} / {a.get('quota_weekly_limit') or '∞'}"
+            wr = format_remaining_time(wwk.get("reset_at") or a.get("quota_weekly_reset_at"))
+            lines.append(f"| {act} | `{acc_id}` | {lbl} | {su} | {sr} | {wu} | {wr} |")
         return "\n".join(lines)
+
+
+class LocalRotator(OpenProxyRotator):
+    """Local file-based account rotator."""
+
+    def __init__(
+        self,
+        state_file: Optional[str] = None,
+        accounts_dir: Optional[str] = None,
+        quota_threshold_percent: float = 95.0,
+        cooldown_minutes: int = 15,
+        backend: Any = None,
+    ) -> None:
+        super().__init__(quota_threshold_percent=quota_threshold_percent, cooldown_minutes=cooldown_minutes)
+        self.backend = backend or LocalBackend(state_file=state_file, accounts_dir=accounts_dir)
+
+    def list_accounts(self, mark_active: bool = True) -> list[dict[str, Any]]:
+        accounts = self.backend.list_accounts()
+        if not mark_active:
+            for a in accounts:
+                a["is_active"] = False
+        return accounts
+
+    def get_active_account_id(self) -> Any:
+        return self.backend.get_active_account_id()
+
+    def refresh_quota(self, account_id: Any) -> dict[str, Any]:
+        return self.backend.refresh_quota(str(account_id))
+
+    def apply_account(self, account_id: Any) -> dict[str, Any]:
+        aid = str(account_id)
+        res = self.backend.apply_account(aid)
+        self._last_switched_id = aid
+        return res
+
+    def login(self, label: str, timeout: int = 300) -> dict[str, Any]:
+        return self.backend.login(label, timeout=timeout)
+
+    def remove_account(self, label: str) -> bool:
+        return self.backend.remove_account(label)
+
+
+AntigravityRotator = OpenProxyRotator
+
+
+def resolve_backend_choice(
+    config_choice: Optional[str] = None,
+    openproxy_token: Optional[str] = None,
+    script_path: Optional[Path | str] = None,
+) -> str:
+    choice = (config_choice or os.environ.get("ANTIGRAVITY_ROTATOR_BACKEND", "auto")).lower().strip()
+    if choice in ("openproxy", "local"):
+        return choice
+    _, resolved_token = resolve_openproxy_credentials(
+        config_token=openproxy_token,
+        script_path=script_path,
+    )
+    return "openproxy" if resolved_token else "local"
+
+
+def create_rotator(
+    backend_choice: Optional[str] = None,
+    openproxy_url: Optional[str] = None,
+    openproxy_token: Optional[str] = None,
+    quota_threshold_percent: float = 95.0,
+    cooldown_minutes: int = 15,
+    state_file: Optional[str] = None,
+    accounts_dir: Optional[str] = None,
+    script_path: Optional[Path | str] = None,
+) -> OpenProxyRotator:
+    choice = resolve_backend_choice(
+        config_choice=backend_choice,
+        openproxy_token=openproxy_token,
+        script_path=script_path,
+    )
+    if choice == "openproxy":
+        return OpenProxyRotator(
+            api_url=openproxy_url,
+            token=openproxy_token,
+            quota_threshold_percent=quota_threshold_percent,
+            cooldown_minutes=cooldown_minutes,
+            script_path=script_path,
+        )
+    return LocalRotator(
+        state_file=state_file,
+        accounts_dir=accounts_dir,
+        quota_threshold_percent=quota_threshold_percent,
+        cooldown_minutes=cooldown_minutes,
+    )
+

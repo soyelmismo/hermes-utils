@@ -1,27 +1,28 @@
 """Google Antigravity account rotator plugin for Hermes Agent.
 
-Provides automatic account failover when 5-hour session or weekly quotas
-are reached in Google Antigravity, seamlessly swapping credentials via
-OpenProxy without altering or polluting the provider plugin.
+Provides automatic account failover when session or weekly quotas
+are reached in Google Antigravity, switching credentials via
+OpenProxy or local backends without altering the provider plugin.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 
 try:
     from .cli import handle_cli, setup_cli
-    from .rotator import OpenProxyRotator
+    from .rotator import OpenProxyRotator, create_rotator
 except ImportError:
     from cli import handle_cli, setup_cli
-    from rotator import OpenProxyRotator
+    from rotator import OpenProxyRotator, create_rotator
 
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 _AGY_PROVIDERS = {
     "antigravity",
@@ -30,6 +31,7 @@ _AGY_PROVIDERS = {
     "antigravity-directsdk",
 }
 
+# Quota exhaustion error patterns (transient rate limiting / throttling removed)
 _QUOTA_ERROR_PATTERNS = (
     "resource_exhausted",
     "resource exhausted",
@@ -40,12 +42,12 @@ _QUOTA_ERROR_PATTERNS = (
     "exhausted your capacity",
     "exceeded your current quota",
     "capacity exhausted",
-    "rate limit",
-    "ratelimit",
-    "too many requests",
     "out of quota",
+    "billing hard limit",
+    "insufficient_quota",
 )
-# "429" as a standalone token only (avoid matching sizes/IDs like 4290)
+
+# Standalone 429 token pattern
 _QUOTA_STATUS_CODE_PATTERN = re.compile(r"\b429\b")
 
 
@@ -58,7 +60,7 @@ def _is_antigravity_provider(provider: str | None) -> bool:
 
 
 def _is_quota_error(error_message: str | None, error: Exception | None = None) -> bool:
-    """Detect if an API error signifies quota exhaustion or rate limiting."""
+    """Detect if an API error signifies quota exhaustion (not transient throttling)."""
     haystack = []
     if error_message:
         haystack.append(str(error_message).lower())
@@ -73,16 +75,31 @@ def _is_quota_error(error_message: str | None, error: Exception | None = None) -
 
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
-    # Resolve configuration
-    api_url = ctx.get_config("openproxy_url")
-    token = ctx.get_config("openproxy_token")
-    auto_rotate = ctx.get_config("auto_rotate", True)
+    backend_choice = ctx.get_config("backend") or os.getenv("ANTIGRAVITY_ROTATOR_BACKEND", "auto")
+    api_url = (
+        ctx.get_config("openproxy_url")
+        or os.getenv("OPENPROXY_ADMIN_URL")
+        or os.getenv("SWITCH_ACCOUNT_API_URL")
+    )
+    token = (
+        ctx.get_config("openproxy_token")
+        or os.getenv("OPENPROXY_ADMIN_TOKEN")
+        or os.getenv("SWITCH_ACCOUNT_TOKEN")
+    )
     threshold = float(ctx.get_config("quota_threshold_percent", 95.0))
+    cooldown = int(ctx.get_config("cooldown_minutes", 15))
+    auto_rotate = ctx.get_config("auto_rotate", True)
+    state_file = ctx.get_config("accounts_file") or os.getenv("ANTIGRAVITY_ACCOUNTS_FILE")
+    accounts_dir = ctx.get_config("accounts_dir") or os.getenv("ANTIGRAVITY_ACCOUNTS_DIR")
 
-    rotator = OpenProxyRotator(
-        api_url=api_url,
-        token=token,
+    rotator = create_rotator(
+        backend_choice=backend_choice,
+        openproxy_url=api_url,
+        openproxy_token=token,
         quota_threshold_percent=threshold,
+        cooldown_minutes=cooldown,
+        state_file=state_file,
+        accounts_dir=accounts_dir,
     )
 
     # ── Hook: transform_api_error_classification ─────────────────────────────
@@ -106,7 +123,7 @@ def register(ctx: Any) -> None:
             return None
 
         try:
-            _, msg = rotator.rotate_to_next_account()
+            _, msg = rotator.rotate_to_next_account(model=model, quota_exhausted=True)
             return {
                 "reason": "rate_limit",
                 "retryable": True,
@@ -120,8 +137,8 @@ def register(ctx: Any) -> None:
     ctx.register_hook("transform_api_error_classification", _on_transform_api_error_classification)
 
     # ── Tool: antigravity_list_accounts ──────────────────────────────────────
-    def _handle_list_accounts() -> str:
-        return rotator.format_status_table()
+    def _handle_list_accounts(model: str = "") -> str:
+        return rotator.format_status_table(model=model)
 
     ctx.register_tool(
         name="antigravity_list_accounts",
@@ -131,12 +148,17 @@ def register(ctx: Any) -> None:
             "function": {
                 "name": "antigravity_list_accounts",
                 "description": (
-                    "List all Google Antigravity accounts registered in OpenProxy, "
+                    "List all Google Antigravity accounts with live quota telemetry, "
                     "including 5-hour rolling session quota, weekly quota, and reset countdowns."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "model": {
+                            "type": "string",
+                            "description": "Optional model to display quota for (e.g. 'claude-3-5-sonnet' or 'gemini-2.0-flash').",
+                        },
+                    },
                 },
             },
         },
@@ -146,7 +168,7 @@ def register(ctx: Any) -> None:
     )
 
     # ── Tool: antigravity_switch_account ─────────────────────────────────────
-    def _handle_switch_account(account_id: int | None = None) -> str:
+    def _handle_switch_account(account_id: Any = None, model: str = "") -> str:
         if account_id is not None:
             try:
                 rotator.apply_account(account_id)
@@ -154,7 +176,7 @@ def register(ctx: Any) -> None:
                 return f"Failed to switch to account [{account_id}]: {exc}"
             return f"Successfully switched agy CLI to account [{account_id}]."
         try:
-            _, msg = rotator.rotate_to_next_account()
+            _, msg = rotator.rotate_to_next_account(model=model)
         except RuntimeError as exc:
             return str(exc)
         return msg
@@ -167,15 +189,19 @@ def register(ctx: Any) -> None:
             "function": {
                 "name": "antigravity_switch_account",
                 "description": (
-                    "Switch the local agy CLI to a specific Google Antigravity account ID, "
-                    "or auto-rotate to the account with the most remaining quota if no ID is specified."
+                    "Switch the local agy CLI to a specific Google Antigravity account ID or label, "
+                    "or auto-rotate to the account with the most remaining quota for the specified model."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "account_id": {
-                            "type": "integer",
-                            "description": "Optional account ID to switch to. If omitted, picks the best available account.",
+                            "type": "string",
+                            "description": "Optional account ID (integer for OpenProxy, label string for local backend).",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional target model name for pool selection.",
                         },
                     },
                 },
@@ -187,7 +213,7 @@ def register(ctx: Any) -> None:
     )
 
     # ── Tool: antigravity_refresh_quotas ─────────────────────────────────────
-    def _handle_refresh_quotas(account_id: int | None = None) -> str:
+    def _handle_refresh_quotas(account_id: Any = None) -> str:
         if account_id is not None:
             res = rotator.refresh_quota(account_id)
             return f"Quota refreshed for [{account_id}]: {res}"
@@ -205,13 +231,13 @@ def register(ctx: Any) -> None:
             "type": "function",
             "function": {
                 "name": "antigravity_refresh_quotas",
-                "description": "Refresh live quota telemetry for Google Antigravity accounts from Google via OpenProxy.",
+                "description": "Refresh live quota telemetry for Google Antigravity accounts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "account_id": {
-                            "type": "integer",
-                            "description": "Optional specific account ID to refresh. If omitted, refreshes all accounts.",
+                            "type": "string",
+                            "description": "Optional specific account ID or label to refresh. If omitted, refreshes all.",
                         },
                     },
                 },
@@ -225,9 +251,9 @@ def register(ctx: Any) -> None:
     # ── CLI Command: hermes antigravity ──────────────────────────────────────
     ctx.register_cli_command(
         name="antigravity",
-        help="Inspect and switch Google Antigravity accounts via OpenProxy",
+        help="Inspect and switch Google Antigravity accounts via OpenProxy or local backend",
         setup_fn=setup_cli,
-        handler_fn=handle_cli,
+        handler_fn=lambda args: handle_cli(args, rotator=rotator),
         description="Operator CLI for Antigravity account rotation and quota telemetry.",
     )
 
