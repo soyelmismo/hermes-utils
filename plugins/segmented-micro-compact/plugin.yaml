@@ -1,0 +1,16 @@
+name: segmented-micro-compact
+version: 1.0.0
+manifest_version: 1
+description: >-
+  Context engine that keeps the built-in threshold compaction untouched and
+  changes only micro-compaction: every pass summarizes the next un-absorbed
+  exchange into a NEW independent summary marker, so the transcript accumulates
+  <segment #1, segment #2, ...> instead of overwriting a single rolling marker.
+  Earlier segment summaries are never re-summarized, never superseded, and the
+  regular general compaction collapses them all as ordinary history when the
+  threshold is reached. Also provides fail-closed tool thread compaction for
+  assistant tool executions across normal and interrupted turns.
+author: Hermeona
+kind: standalone
+provides_hooks:
+  - transform_llm_output
