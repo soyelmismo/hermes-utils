@@ -26,6 +26,32 @@ It is disabled by default and requires `micro_compact: true` because it reuses t
 When enabled, it summarizes completed assistant tool-call/result threads at turn finalization, preserving user messages and the final response unchanged.
 It does not wait for the 10-turn cadence to summarize tool threads.
 
+Tool-thread and segment compaction are **alternative policies**, never two stages
+in a pipeline. With `tool_thread_compact: true`, finalization returns directly
+from the tool policy and does not run segment summarization over its output.
+Each pass makes at most **one auxiliary `call_llm` invocation**. One thread uses
+the bullet contract; multiple independent threads share one JSON request/response,
+validated by unique integer IDs before any splice. There are no repair calls.
+User messages, OOB steers, and final answers remain verbatim and in position.
+
+The batch is bounded by the engine's input window and output-summary budget
+(1500 output tokens reserved per thread, at most 25 threads). Oversized or excess
+threads remain raw for later passes or normal threshold compression; the plugin
+never truncates raw evidence just to fit. Input selection uses original rows only.
+Existing tool markers are recognized by metadata, canonical wrapper, or legacy
+prefix even after SQLite reload, and are excluded from micro-summary selection.
+
+Invalid/empty/truncated responses and non-shrinking spans are remembered by
+SHA-256 of their serialized input in a per-engine bounded cache (128 entries),
+so index changes do not cause immediate retries on identical input. Changed input
+or a session reset can be attempted again. This cache is not persisted across
+process restarts. Reentrant tool passes are rejected. The batch uses one atomic
+watermark/coverage-aware DB commit, and DB failures leave the original history
+intact instead of accepting the core helper's best-effort success.
+
+The one-call guarantee covers this plugin's micro-compaction pass, not provider
+transport retries/fallbacks or Hermes' separate threshold context compression.
+
 The final response is generated using the complete data.
 The summary is produced at turn finalization, before persistence, and replaces the tool thread before the final response in conversation history.
 The context stays at the beginning of the assistant span, without moving to the user message or system prompt.
@@ -51,5 +77,5 @@ Semantic fidelity depends on the model and prompt and is not guaranteed by the p
 
 ## Testing without API calls
 
-Run `python3 run_tests.py` to execute both `test_segmented_micro_compact.py` and `verify_tool_thread.py`.
+Run `python3 run_tests.py` to execute `test_segmented_micro_compact.py`, `verify_tool_thread.py`, and `verify_single_pass.py`.
 The tests run entirely offline with deterministic mocks, without accessing the network or changing the kernel namespace.

@@ -27,7 +27,10 @@ def engine(enabled=True):
     e.context_length = 100000
     e._micro_compact_enabled = True
     e._micro_compact_every_n_turns = 10
-    e._tool_thread_summarize_one = lambda text: '- ran: read_file -> read source\n- ran: terminal -> 9 tests passed'
+    summary = '- ran: read_file -> read source\n- ran: terminal -> 9 tests passed'
+    e._tool_thread_summarize_one = lambda text: summary
+    import json
+    e._tool_thread_summarize_batch = lambda items: json.dumps([{'id': item['id'], 'summary': summary} for item in items])
     return e
 
 
@@ -56,7 +59,7 @@ def check_splice_and_cadence():
     assert len(output) == 3
     assert output[0] is r[0] and output[-1] is r[-1]
     assert output[1][TOOL_THREAD_MARKER]
-    assert e._micro_compact_turns_since_pass == 1
+    assert e._micro_compact_turns_since_pass == 0
     assert e._tool_thread_tokens_saved > 3900
     print('Estimated saved tokens:', e._tool_thread_tokens_saved)
     assert len(r) == 6

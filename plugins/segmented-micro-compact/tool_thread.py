@@ -122,87 +122,132 @@ def find_tool_thread(messages: list[dict[str, Any]]) -> tuple[int, int] | None:
     return spans[0] if spans else None
 
 
+def _valid_summary(summary: Any) -> bool:
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 2400:
+        return False
+    bullets = [line.strip() for line in summary.splitlines() if line.strip()]
+    return 1 <= len(bullets) <= 8 and all(line.startswith("- ") for line in bullets)
+
+
+def _batch_summaries(raw: Any, count: int) -> list[str] | None:
+    """Reject missing, duplicate, unexpected IDs and malformed output atomically."""
+    import json
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or len(parsed) != count:
+        return None
+    found = {}
+    for item in parsed:
+        if not isinstance(item, dict) or set(item) != {"id", "summary"}:
+            return None
+        ident, summary = item["id"], item["summary"]
+        if type(ident) is not int or not 0 <= ident < count or ident in found:
+            return None
+        if not _valid_summary(summary):
+            return None
+        found[ident] = summary
+    return [found[i] for i in range(count)]
+
+
 def compact_tool_thread(engine: Any, messages: list) -> list:
-    """Compact all resolved tool thread spans in messages."""
-    failed_spans: set[tuple[int, int]] = set()
-    attempts = 0
-    max_attempts = 25
+    """Plan from ORIGINAL rows, call once, validate everything, commit once.
 
-    while attempts < max_attempts:
-        candidate_spans = [s for s in find_tool_threads(messages) if s not in failed_spans]
-        if not candidate_spans:
-            break
-        span = candidate_spans[0]
-        start, end = span
-        rows = messages[start:end]
-
-        try:
-            skip, watermark = engine._micro_start_watermark(messages)
-            if skip:
-                break
+    Never feed a produced marker to another summarizer. Independent spans are
+    batched so OOB user boundaries/final answers stay in their original positions.
+    Bounded input/output budgets defer excess spans to later turns, not retries
+    within this pass. Reentrant invocations cannot start another summary call.
+    """
+    import hashlib
+    if getattr(engine, "_tool_thread_inflight", False):
+        return messages
+    engine._tool_thread_inflight = True
+    fingerprints = []
+    failed = None
+    try:
+        failed = getattr(engine, "_tool_thread_failed_inputs", None)
+        if failed is None:
+            engine._tool_thread_failed_inputs = failed = {}
+        spans, items, fingerprints = [], [], []
+        max_spans = max(1, min(25, (engine.max_summary_tokens or 1500) // 1500))
+        input_budget = max(1, int(engine.context_length * 0.5) - 1500 * max_spans - 1000)
+        used = 0
+        for start, end in find_tool_threads(messages):
+            rows = messages[start:end]
+            if any(engine._is_context_summary_message(row) for row in rows):
+                continue
             text = engine._serialize_for_summary(rows)
-            summary = engine._tool_thread_summarize_one(text)
-            if not isinstance(summary, str) or not summary.strip():
-                failed_spans.add(span)
-                attempts += 1
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            size = estimate_messages_tokens_rough(rows)
+            if digest in failed or size + used > input_budget:
                 continue
+            spans.append((start, end))
+            items.append({"id": len(items), "text": text})
+            fingerprints.append(digest)
+            used += size
+            if len(spans) >= max_spans:
+                break
+        if not spans:
+            return messages
+        skip, watermark = engine._micro_start_watermark(messages)
+        if skip:
+            return messages
+        if len(items) == 1:
+            raw = engine._tool_thread_summarize_one(items[0]["text"])
+            summaries = [raw] if _valid_summary(raw) else None
+        else:
+            raw = engine._tool_thread_summarize_batch(items)
+            summaries = _batch_summaries(raw, len(items))
+        if summaries is None:
+            for digest in fingerprints:
+                failed[digest] = True
+            while len(failed) > 128:
+                del failed[next(iter(failed))]
+            return messages
 
-            # Reject malformed prose or unexpectedly verbose model output.
-            bullets = [b.strip() for b in summary.strip().splitlines() if b.strip()]
-            if (
-                not bullets
-                or len(bullets) > 8
-                or any(not b.startswith("- ") for b in bullets)
-                or len(summary) > 2400
-            ):
-                failed_spans.add(span)
-                attempts += 1
-                continue
-
+        result = []
+        cursor = engine._micro_compact_cursor
+        last = 0
+        saved = 0
+        accepted = 0
+        for (start, end), summary, digest in zip(spans, summaries, fingerprints):
             block = render_tool_thread_summary(summary)
-            marker = {
-                "role": "assistant",
-                # Keep the reference visible in history before the final response.
-                # The explicit sidecar preserves the same bytes on request replay.
-                "content": block,
-                "api_content": block,
-                TOOL_THREAD_MARKER: True,
-            }
-
-            before = estimate_messages_tokens_rough(rows)
+            marker = {"role": "assistant", "content": block,
+                      "api_content": block, TOOL_THREAD_MARKER: True}
+            before = estimate_messages_tokens_rough(messages[start:end])
             after = estimate_messages_tokens_rough([marker])
+            result.extend(messages[last:start])
             if after >= before:
-                # Compression would not save tokens; skip this span
-                failed_spans.add(span)
-                attempts += 1
-                continue
-
-            result = messages[:start] + [marker] + messages[end:]
-            if not commit_tool_thread(engine, messages, result, watermark):
-                failed_spans.add(span)
-                attempts += 1
-                continue
-
-            # Translate the old-exchange cursor if this splice shortened its prefix.
-            cursor = engine._micro_compact_cursor
-            if cursor >= end:
-                engine._micro_compact_cursor = cursor - (end - start) + 1
-            elif cursor > start:
-                engine._micro_compact_cursor = start
-
-            engine._flush_scan_cursor_invalidated = True
-            engine._tool_thread_passes += 1
-            engine._tool_thread_tokens_saved += before - after
-            logger.info("Tool-thread compaction: rows=%d->1 tokens_est=%d->%d", len(rows), before, after)
-
-            # Succeeded: update messages and reset failed_spans for the newly-indexed messages
-            messages = result
-            failed_spans.clear()
-            attempts += 1
-
-        except Exception:
-            logger.warning("Tool-thread summary failed; keeping original transcript", exc_info=True)
-            failed_spans.add(span)
-            attempts += 1
-
-    return messages
+                result.extend(messages[start:end])
+                failed[digest] = True
+            else:
+                result.append(marker)
+                saved += before - after
+                accepted += 1
+                if engine._micro_compact_cursor >= end:
+                    cursor -= end - start - 1
+                elif engine._micro_compact_cursor > start:
+                    cursor = len(result) - 1
+            last = end
+        result.extend(messages[last:])
+        while len(failed) > 128:
+            del failed[next(iter(failed))]
+        if not accepted or not commit_tool_thread(engine, messages, result, watermark):
+            return messages
+        engine._micro_compact_cursor = cursor
+        engine._flush_scan_cursor_invalidated = True
+        engine._tool_thread_passes += 1
+        engine._tool_thread_tokens_saved += saved
+        logger.info("Tool-thread batch: spans=%d calls=1 tokens_saved=%d", accepted, saved)
+        return result
+    except Exception:
+        if failed is not None:
+            for digest in fingerprints:
+                failed[digest] = True
+            while len(failed) > 128:
+                del failed[next(iter(failed))]
+        logger.warning("Tool-thread pass failed; keeping original transcript", exc_info=True)
+        return messages
+    finally:
+        engine._tool_thread_inflight = False

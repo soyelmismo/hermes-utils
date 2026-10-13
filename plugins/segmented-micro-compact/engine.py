@@ -6,11 +6,11 @@ from typing import Any, Optional
 from agent.context_compressor import ContextCompressor
 
 try:
-    from .markers import SEGMENT_MARKER_KEY, SEGMENT_PREFIX, SEGMENT_END_MARKER, TOOL_THREAD_MARKER
+    from .markers import SEGMENT_MARKER_KEY, SEGMENT_PREFIX, SEGMENT_END_MARKER, TOOL_THREAD_MARKER, is_tool_summary
     from .prompts import build_segment_summary_prompt
     from .summarizer import SummarizerMixin
 except (ImportError, ValueError):
-    from markers import SEGMENT_MARKER_KEY, SEGMENT_PREFIX, SEGMENT_END_MARKER, TOOL_THREAD_MARKER
+    from markers import SEGMENT_MARKER_KEY, SEGMENT_PREFIX, SEGMENT_END_MARKER, TOOL_THREAD_MARKER, is_tool_summary
     from prompts import build_segment_summary_prompt
     from summarizer import SummarizerMixin
 
@@ -28,6 +28,8 @@ class SegmentedMicroCompactEngine(SummarizerMixin, ContextCompressor):
         self._tool_thread_compact_enabled = kwargs.pop("tool_thread_compact", False) is True
         self._tool_thread_passes = 0
         self._tool_thread_tokens_saved = 0
+        self._tool_thread_failed_inputs = {}
+        self._tool_thread_inflight = False
         super().__init__(model=model, **kwargs)
 
     @property
@@ -57,7 +59,7 @@ class SegmentedMicroCompactEngine(SummarizerMixin, ContextCompressor):
     def _is_context_summary_message(cls, message: Any) -> bool:
         if not isinstance(message, dict):
             return False
-        if cls._is_segment_marker(message):
+        if cls._is_segment_marker(message) or is_tool_summary(message):
             return True
         return super()._is_context_summary_message(message)
 
@@ -142,11 +144,13 @@ class SegmentedMicroCompactEngine(SummarizerMixin, ContextCompressor):
         if not self._micro_compact_enabled:
             return messages
         if self._tool_thread_compact_enabled:
+            # Alternative policy, NOT a preprocessing stage for segment summaries.
+            # Tool work is summarized once; user/final messages remain verbatim.
             try:
                 from .tool_thread import compact_tool_thread
             except (ImportError, ValueError):
                 from tool_thread import compact_tool_thread
-            messages = compact_tool_thread(self, messages)
+            return compact_tool_thread(self, messages)
 
         every_n = max(1, int(self._micro_compact_every_n_turns or 1))
         if every_n > 1:
@@ -215,3 +219,5 @@ class SegmentedMicroCompactEngine(SummarizerMixin, ContextCompressor):
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
+        self._tool_thread_failed_inputs.clear()
+        self._tool_thread_inflight = False

@@ -37,6 +37,21 @@ def build_segment_summary_prompt(exchange_text: str) -> list[dict[str, str]]:
     ]
 
 
+def build_tool_batch_prompt(items: list[dict]) -> list[dict[str, str]]:
+    """One request for original, independent spans. IDs anchor atomic splices."""
+    import json
+    rules = build_tool_prompt("")[0]["content"]
+    return [
+        {"role": "system", "content": rules + (
+            " Summarize each input item independently. Return ONLY a JSON array "
+            "of objects with exactly 'id' (the input integer ID) and 'summary' "
+            "(a string of 1-8 '- ran: ...' bullet lines). Return every ID exactly "
+            "once, in any order. Do not combine items or echo input JSON."
+        )},
+        {"role": "user", "content": "Tool threads to summarize (JSON):\n" + json.dumps(items, ensure_ascii=False)},
+    ]
+
+
 def build_tool_prompt(text: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": (

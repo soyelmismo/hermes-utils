@@ -67,6 +67,28 @@ def sanitize_tool_context(text: str) -> str:
     return cleaned
 
 
+def is_tool_summary(message) -> bool:
+    """Recognize metadata and durable wrappers after SQLite strips plugin keys.
+
+    Restrict content recognition to assistant rows. User prose mentioning a tag
+    is not a summary, and must remain available to the exchange selector.
+    """
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+    if message.get(TOOL_THREAD_MARKER):
+        return True
+    for key in ("content", "api_content"):
+        text = message.get(key)
+        if not isinstance(text, str):
+            continue
+        text = text.lstrip()
+        if text.startswith("[TOOL WORK SUMMARY"):
+            return True
+        if _TOOL_CONTEXT_UNTERMINATED_ECHO_RE.match(text):
+            return True
+    return False
+
+
 def render_tool_thread_summary(summary: str) -> str:
     """Fence conversation-local tool history without claiming memory-provider identity."""
     return (

@@ -16,14 +16,23 @@ class SummarizerMixin:
             from prompts import build_tool_prompt
         return self._summarize_prompt(build_tool_prompt(exchange_text))
 
-    def _summarize_prompt(self, prompt: list[dict[str, str]]) -> Optional[str]:
+    def _tool_thread_summarize_batch(self, items: list[dict]) -> Optional[str]:
+        try:
+            from .prompts import build_tool_batch_prompt
+        except (ImportError, ValueError):
+            from prompts import build_tool_batch_prompt
+        return self._summarize_prompt(
+            build_tool_batch_prompt(items), max_tokens=1500 * len(items),
+        )
+
+    def _summarize_prompt(self, prompt: list[dict[str, str]], *, max_tokens: int = 1500) -> Optional[str]:
         """Call the existing auxiliary compression route and reject partial output."""
         from agent.auxiliary_client import aux_interrupt_protection, call_llm
 
         call_kwargs = {
             "task": "compression",
             "messages": prompt,
-            "max_tokens": min(1500, self.max_summary_tokens or 1500),
+            "max_tokens": min(max_tokens, getattr(self, "max_summary_tokens", None) or max_tokens),
             "temperature": 0.1,
         }
         self._apply_summary_route(call_kwargs)
