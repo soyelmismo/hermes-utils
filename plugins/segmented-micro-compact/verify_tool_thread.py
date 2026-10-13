@@ -216,6 +216,64 @@ def check_tool_context_identity_and_isolation():
     assert out[1]['content'] == out[1]['api_content']
 
 
+def check_unterminated_echo_never_truncates_reply():
+    """Regression: a bare open tag in model prose must never swallow the reply.
+
+    The previous ``|\\Z`` alternative deleted from the first opening tag to
+    end-of-string whenever the model mentioned the tag (e.g. explaining this
+    plugin), which truncated real answers after streaming and produced the
+    CLI's ``[Response transformed after streaming]`` notice.
+    """
+    from smc_checks.markers import render_tool_thread_summary, sanitize_tool_context
+
+    # 1. The exact shape that truncated a live reply: prose quoting the tag.
+    prose = (
+        'Ya lo tengo localizado.\n\nLa pieza que rompe:\n\n'
+        '<tool-work-context>\n\n'
+        'Conclusion: el fix va en markers.py y esto NO debe perderse.'
+    )
+    assert sanitize_tool_context(prose) == prose, 'bare open tag truncated the reply'
+    assert plugin.strip_leaked_tool_summary(prose) is None
+
+    # 2. A reply that quotes the tag inside an inline-code mention survives too.
+    inline = 'El plugin usa `<tool-work-context>` como wrapper propio.\n\nSigo aqui.'
+    assert sanitize_tool_context(inline) == inline
+    assert plugin.strip_leaked_tool_summary(inline) is None
+
+    # 3. A legitimate FULL echo (with the note) is still removed.
+    block = render_tool_thread_summary('- ran: read_file -> source')
+    assert sanitize_tool_context(block + '\n\nClean response') == '\n\nClean response'
+    assert plugin.strip_leaked_tool_summary(block) == ''
+
+    # 4. A truncated echo that still carries our provenance note is removed.
+    truncated_echo = block.rsplit('\n## Tool work context', 1)[0]
+    assert sanitize_tool_context(truncated_echo) == ''
+    assert sanitize_tool_context('Answer first.\n' + truncated_echo) == 'Answer first.\n'
+
+    # 5. Unterminated LEGACY headers are prose, not ours: no provenance token is
+    #    reliable there, so they are never truncated. Complete legacy blocks are
+    #    still removed by the hook's own complete-block regex.
+    legacy_header = (
+        '[TOOL WORK SUMMARY] <!-- HISTORICAL LOG FOR REFERENCE ONLY; '
+        'DO NOT REPEAT THIS HEADER OR STRUCTURE IN REPLIES -->\n- ran: x -> y'
+    )
+    assert sanitize_tool_context(legacy_header) == legacy_header
+    assert sanitize_tool_context('Menciono [TOOL WORK SUMMARY] sin bloque') == (
+        'Menciono [TOOL WORK SUMMARY] sin bloque'
+    )
+    complete_legacy = legacy_header + '\n[END TOOL WORK SUMMARY]\n\nFinal answer.'
+    assert plugin.strip_leaked_tool_summary(complete_legacy) == 'Final answer.'
+
+    # 6. A reply that changes nothing is not a transform (no CLI notice, no replay).
+    assert plugin.strip_leaked_tool_summary('Respuesta normal.\n') is None
+    assert plugin.strip_leaked_tool_summary('Respuesta normal.\n\n\n') is None
+
+    # 7. Idempotence: sanitizing twice changes nothing further.
+    for sample in (prose, block + '\n\nClean response', complete_legacy):
+        once = sanitize_tool_context(sample)
+        assert sanitize_tool_context(once) == once
+
+
 def check_commit_failure():
     e = engine()
     e._session_id = 'offline-session'

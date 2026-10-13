@@ -34,7 +34,9 @@ It does not call `build_memory_context_block` or use `<memory-context>`; that fe
 The block is stored in visible `content` and mirrored in `api_content`, so history retains the reference above the final response and request replay uses identical bytes.
 An empty `content` would hide the summary from the UI even when model injection still works. Do not use a model-only sidecar for this history-visible feature.
 The core replays the block at the same assistant position, including after resuming from SQLite; persistence may omit a redundant sidecar when it equals `content`.
-The final-output hook removes echoed tool-context blocks, including unterminated trailing blocks, and complete legacy `[TOOL WORK SUMMARY]` blocks when visible response text remains. It leaves Holographic memory blocks untouched.
+The final-output hook removes echoed tool-context blocks and complete legacy `[TOOL WORK SUMMARY]` blocks when visible response text remains. It leaves Holographic memory blocks untouched.
+A closed block is removed wherever it appears. An unterminated block is removed ONLY when it is verifiably our own echo, i.e. the canonical note or the `## Tool work context` heading directly follows the opening tag. A bare opening tag in model prose (a reply that mentions or quotes the wrapper) is never truncated, so the hook cannot cut an answer short or trigger the CLI's post-stream transform notice on a reply it did not change.
+The hook returns `None` whenever the text is unchanged, so no transform is recorded for untouched replies.
 The current core ignores empty-string output transformations, so a response consisting entirely of internal context is not suppressed by this hook alone.
 Streaming observers cannot transform deltas. The core streaming scrubber recognizes memory fences only, so a model-echoed tool-context block can appear during live streaming before the final-output hook removes it. No core files or global scrubbers are patched by this plugin.
 Restart the CLI or gateway to load the change. It applies to new summaries and does not rewrite previously persisted summaries.

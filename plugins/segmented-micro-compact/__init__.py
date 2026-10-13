@@ -47,12 +47,19 @@ _LEGACY_TOOL_SUMMARY_RE = re.compile(
 
 
 def strip_leaked_tool_summary(response_text: str, **kwargs: Any) -> str | None:
-    """Scrub plugin-owned tool context and complete legacy blocks, including mid-reply."""
+    """Scrub plugin-owned tool context and complete legacy blocks, including mid-reply.
+
+    Returns ``None`` when nothing was removed, so the host never records a
+    transform (and never prints its post-stream transform notice) for a reply we
+    left untouched. Trailing whitespace alone must not count as a change.
+    """
     if not isinstance(response_text, str):
         return None
     text = sanitize_tool_context(response_text)
     text = _LEGACY_TOOL_SUMMARY_RE.sub("", text)
-    return text.strip() if text != response_text else None
+    if text == response_text:
+        return None
+    return text.strip()
 
 
 def register(ctx) -> None:
