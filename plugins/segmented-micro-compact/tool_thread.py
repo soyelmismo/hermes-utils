@@ -159,12 +159,13 @@ def compact_tool_thread(engine: Any, messages: list) -> list:
                 attempts += 1
                 continue
 
+            block = render_tool_thread_summary(summary)
             marker = {
                 "role": "assistant",
-                # Keep conversation-local tool context in the replay sidecar.
-                # Display content stays empty; the core replays api_content in place.
-                "content": "",
-                "api_content": render_tool_thread_summary(summary),
+                # Keep the reference visible in history before the final response.
+                # The explicit sidecar preserves the same bytes on request replay.
+                "content": block,
+                "api_content": block,
                 TOOL_THREAD_MARKER: True,
             }
 

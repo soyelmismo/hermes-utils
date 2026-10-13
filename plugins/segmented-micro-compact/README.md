@@ -31,8 +31,9 @@ The summary is produced at turn finalization, before persistence, and replaces t
 The context stays at the beginning of the assistant span, without moving to the user message or system prompt.
 It uses a plugin-owned `<tool-work-context>` wrapper and a context note identifying conversation-local tool history, not persistent memory or instructions.
 It does not call `build_memory_context_block` or use `<memory-context>`; that fence remains reserved for memory-provider context.
-The model-only block is stored in `api_content`, with empty `content`, keeping the historical row out of the UI.
-When preparing the request, the core substitutes `api_content` for `content` at the same assistant position, including after resuming from SQLite.
+The block is stored in visible `content` and mirrored in `api_content`, so history retains the reference above the final response and request replay uses identical bytes.
+An empty `content` would hide the summary from the UI even when model injection still works. Do not use a model-only sidecar for this history-visible feature.
+The core replays the block at the same assistant position, including after resuming from SQLite; persistence may omit a redundant sidecar when it equals `content`.
 The final-output hook removes echoed tool-context blocks, including unterminated trailing blocks, and complete legacy `[TOOL WORK SUMMARY]` blocks when visible response text remains. It leaves Holographic memory blocks untouched.
 The current core ignores empty-string output transformations, so a response consisting entirely of internal context is not suppressed by this hook alone.
 Streaming observers cannot transform deltas. The core streaming scrubber recognizes memory fences only, so a model-echoed tool-context block can appear during live streaming before the final-output hook removes it. No core files or global scrubbers are patched by this plugin.

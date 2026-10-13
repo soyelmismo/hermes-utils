@@ -213,7 +213,7 @@ def check_tool_context_identity_and_isolation():
     out = engine()._micro_compact(r)
     assert out[0] is r[0] and out[-1] is r[-1]
     assert out[1]['role'] == 'assistant' and out[1]['api_content'].startswith('<tool-work-context>\n')
-    assert out[1]['content'] == ''
+    assert out[1]['content'] == out[1]['api_content']
 
 
 def check_commit_failure():
@@ -254,15 +254,29 @@ def check_finalizer_integration():
         assert loaded[0]['content'] == before[0]['content']
         assert loaded[-1]['content'] == before[-1]['content']
         assert loaded[1]['role'] == 'assistant'
-        assert loaded[1]['content'] == ''
-        assert loaded[1]['api_content'].startswith('<tool-work-context>\n')
-        assert '<memory-context>' not in loaded[1]['api_content']
-        assert '## Tool work context' in loaded[1]['api_content']
-        assert '[TOOL WORK SUMMARY]' not in loaded[1]['api_content']
-        from agent.turn_context import substitute_api_content
-        wire = dict(loaded[1])
-        substitute_api_content(wire)
-        assert wire['content'] == loaded[1]['api_content']
+        block = loaded[1]['content']
+        assert block.startswith('<tool-work-context>\n')
+        assert '<memory-context>' not in block
+        assert '## Tool work context' in block
+        assert '[TOOL WORK SUMMARY]' not in block
+        # Exercise the real request builder, not only the sidecar helper.
+        from agent.turn_context import build_api_messages
+        import time
+        request_agent = SimpleNamespace(
+            _current_turn_timestamp=time.time(),
+            _copy_reasoning_content_for_api=lambda *args: None,
+            _should_sanitize_tool_calls=lambda: False,
+            ephemeral_system_prompt='',
+        )
+        replay = loaded + [{'role': 'user', 'content': 'Next turn'}]
+        wire, _ = build_api_messages(
+            request_agent, replay, current_turn_user_idx=len(replay) - 1,
+            ext_prefetch_cache='', plugin_user_context='', moa_config=None,
+            active_system_prompt='',
+        )
+        assert wire[1]['content'] == block
+        assert wire[2]['content'] == before[-1]['content']
+        assert 'api_content' not in wire[1]
         assert not any(m.get('role') == 'tool' for m in loaded)
         print('SQLite resume:', len(before), '->', len(loaded), 'active messages')
         db.close()
