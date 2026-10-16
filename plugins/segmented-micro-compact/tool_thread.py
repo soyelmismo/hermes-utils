@@ -11,11 +11,13 @@ from typing import Any
 from agent.model_metadata import estimate_messages_tokens_rough
 
 try:
-    from .markers import TOOL_THREAD_MARKER, render_tool_thread_summary
+    from .markers import TOOL_THREAD_MARKER, tool_summary_message
     from .persistence import commit_tool_thread
+    from .skill_retention import compaction_parts
 except (ImportError, ValueError):
-    from markers import TOOL_THREAD_MARKER, render_tool_thread_summary
+    from markers import TOOL_THREAD_MARKER, tool_summary_message
     from persistence import commit_tool_thread
+    from skill_retention import compaction_parts
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +175,11 @@ def compact_tool_thread(engine: Any, messages: list) -> list:
         max_spans = max(1, min(25, (engine.max_summary_tokens or 1500) // 1500))
         input_budget = max(1, int(engine.context_length * 0.5) - 1500 * max_spans - 1000)
         used = 0
-        for start, end in find_tool_threads(messages):
-            rows = messages[start:end]
+        candidates = (
+            part for start, end in find_tool_threads(messages)
+            for part in compaction_parts(messages, start, end)
+        )
+        for start, end, retained, rows in candidates:
             if any(engine._is_context_summary_message(row) for row in rows):
                 continue
             text = engine._serialize_for_summary(rows)
@@ -182,7 +187,7 @@ def compact_tool_thread(engine: Any, messages: list) -> list:
             size = estimate_messages_tokens_rough(rows)
             if digest in failed or size + used > input_budget:
                 continue
-            spans.append((start, end))
+            spans.append((start, end, retained))
             items.append({"id": len(items), "text": text})
             fingerprints.append(digest)
             used += size
@@ -211,24 +216,26 @@ def compact_tool_thread(engine: Any, messages: list) -> list:
         last = 0
         saved = 0
         accepted = 0
-        for (start, end), summary, digest in zip(spans, summaries, fingerprints):
-            block = render_tool_thread_summary(summary)
-            marker = {"role": "assistant", "content": block,
-                      "api_content": block, TOOL_THREAD_MARKER: True}
+        for (start, end, retained), summary, digest in zip(spans, summaries, fingerprints):
+            marker = tool_summary_message(summary)
+            marker[TOOL_THREAD_MARKER] = True
             before = estimate_messages_tokens_rough(messages[start:end])
-            after = estimate_messages_tokens_rough([marker])
+            replacement = retained + [marker]
+            after = estimate_messages_tokens_rough(replacement)
             result.extend(messages[last:start])
             if after >= before:
                 result.extend(messages[start:end])
                 failed[digest] = True
             else:
-                result.append(marker)
+                result.extend(replacement)
                 saved += before - after
                 accepted += 1
                 if engine._micro_compact_cursor >= end:
-                    cursor -= end - start - 1
+                    cursor -= end - start - len(replacement)
                 elif engine._micro_compact_cursor > start:
-                    cursor = len(result) - 1
+                    # El cursor es una frontera, no el índice del marcador.
+                    # Los spans posteriores al cursor original no lo desplazan.
+                    cursor = len(result)
             last = end
         result.extend(messages[last:])
         while len(failed) > 128:

@@ -8,6 +8,7 @@ SEGMENT_PREFIX = "[SEGMENT SUMMARY"
 SEGMENT_END_MARKER = "[END SEGMENT SUMMARY]"
 
 TOOL_THREAD_MARKER = "_hermes_tool_thread_summary"
+TOOL_CONTEXT_SOURCE = "segmented-micro-compact/tool-thread"
 TOOL_THREAD_PREFIX = (
     "[TOOL WORK SUMMARY] <!-- HISTORICAL LOG FOR REFERENCE ONLY; "
     "DO NOT REPEAT THIS HEADER OR STRUCTURE IN REPLIES -->"
@@ -70,10 +71,16 @@ def sanitize_tool_context(text: str) -> str:
 def is_tool_summary(message) -> bool:
     """Recognize metadata and durable wrappers after SQLite strips plugin keys.
 
-    Restrict content recognition to assistant rows. User prose mentioning a tag
-    is not a summary, and must remain available to the exchange selector.
+    Las filas user requieren procedencia durable. Las citas humanas del bloque
+    no son resúmenes. El fallback textual queda limitado al formato assistant legado.
     """
-    if not isinstance(message, dict) or message.get("role") != "assistant":
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "user":
+        from agent.message_metadata import is_internal_context_message
+        metadata = message.get("display_metadata") or {}
+        return is_internal_context_message(message) and metadata.get("context_source") == TOOL_CONTEXT_SOURCE
+    if message.get("role") != "assistant":
         return False
     if message.get(TOOL_THREAD_MARKER):
         return True
@@ -87,6 +94,20 @@ def is_tool_summary(message) -> bool:
         if _TOOL_CONTEXT_UNTERMINATED_ECHO_RE.match(text):
             return True
     return False
+
+
+def tool_summary_message(summary: str) -> dict:
+    """Fila interna independiente, durable y nunca atribuida al asistente."""
+    # Sin soporte del core, fallar cerrado en vez de fusionar user + memoria.
+    from agent.message_metadata import is_internal_context_message
+    block = render_tool_thread_summary(summary)
+    message = {
+        "role": "user", "content": block, "api_content": block,
+        "display_kind": "hidden",
+        "display_metadata": {"context_source": TOOL_CONTEXT_SOURCE},
+    }
+    assert is_internal_context_message(message)
+    return message
 
 
 def render_tool_thread_summary(summary: str) -> str:

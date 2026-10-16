@@ -47,7 +47,7 @@ def check_oob_one_call_and_verbatim():
     capture(e, calls)
     out = e._micro_compact(source)
     assert len(calls) == 1
-    assert [m for m in out if m['role'] == 'user'] == [m for m in source if m['role'] == 'user']
+    assert [m for m in out if m['role'] == 'user' and not e._is_context_summary_message(m)] == [m for m in source if m['role'] == 'user']
     assert out[-1] is source[-1]
     assert sum(bool(m.get(plugin.TOOL_THREAD_MARKER)) for m in out) == 2
 

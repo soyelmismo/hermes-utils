@@ -32,6 +32,28 @@ class SegmentedMicroCompactEngine(SummarizerMixin, ContextCompressor):
         self._tool_thread_inflight = False
         super().__init__(model=model, **kwargs)
 
+    def _prune_old_tool_results(self, messages, protect_tail_count, protect_tail_tokens=None, min_prune_chars=None):
+        """Protege del prune solo las skills del prefijo inicial de cada turno."""
+        try:
+            from .skill_retention import initial_skill_batches
+        except (ImportError, ValueError):
+            from skill_retention import initial_skill_batches
+        protected_ids = {
+            call["id"] for index in initial_skill_batches(messages)
+            for call in messages[index]["tool_calls"]
+        }
+        if min_prune_chars is None:
+            result, count = super()._prune_old_tool_results(
+                messages, protect_tail_count, protect_tail_tokens)
+        else:
+            result, count = super()._prune_old_tool_results(
+                messages, protect_tail_count, protect_tail_tokens, min_prune_chars)
+        for i, original in enumerate(messages):
+            if original.get("role") == "tool" and original.get("tool_call_id") in protected_ids:
+                result[i] = original
+        count = sum(a != b for a, b in zip(messages, result))
+        return result, count
+
     @property
     def name(self) -> str:
         return self.engine_name

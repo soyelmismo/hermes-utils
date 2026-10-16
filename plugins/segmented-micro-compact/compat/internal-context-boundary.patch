@@ -1,0 +1,229 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 15cd862855c..ee9ab1c9fd9 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -20,7 +20,8 @@ from agent.message_sanitization import (
+     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
+ )
+ from agent.message_metadata import (
+-    TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
++    TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message,
++    is_internal_context_message)
+ from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
+ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+ from agent.think_scrubber import THINK_TAG_NAMES
+@@ -676,6 +677,8 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
+         if (
+             prev is not None and prev.get("role") == "user"
+             and isinstance(msg, dict) and msg.get("role") == "user"
++            # Contexto interno separado: no absorberlo ni absorber la fila humana posterior.
++            and not is_internal_context_message(prev) and not is_internal_context_message(msg)
+             # A summary carrier followed by a new user row is a deliberate durable shape after
+             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
+             and split_user_originated_turn(prev)[0] is None
+@@ -1245,6 +1248,7 @@ _UNMERGEABLE = object()
+ def drop_thinking_only_and_merge_users(
+     messages: list[dict[str, Any]], *, drop_codex_reasoning_items: bool = True,
+     drop_nudge_marker: Optional[str] = None,
++    internal_context_contents: frozenset[str] = frozenset(),
+ ) -> list[dict[str, Any]]:
+     """Drop thinking-only assistant turns and merge adjacent user messages left behind, on the
+     per-call ``api_messages`` copy only (``agent.messages`` is never mutated). Drop-and-merge
+@@ -1267,7 +1271,9 @@ def drop_thinking_only_and_merge_users(
+     for m in kept:
+         prev = merged[-1] if merged else None
+         content = _UNMERGEABLE
+-        if prev is not None and prev.get("role") == "user" and m.get("role") == "user":
++        if (prev is not None and prev.get("role") == "user" and m.get("role") == "user"
++                and not (isinstance(prev.get("content"), str) and prev["content"] in internal_context_contents)
++                and not (isinstance(m.get("content"), str) and m["content"] in internal_context_contents)):
+             content = _merge_user_content(prev.get("content", ""), m.get("content", ""))
+         if content is _UNMERGEABLE:
+             # Not a user pair, or an unknown content shape: append separately (the latter violates
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 13b1d4a08b3..9c9397962a7 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -955,10 +955,11 @@ def _synthetic_user_row(content: str) -> bool:
+ 
+ def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
+     """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
++    from agent.message_metadata import is_internal_context_message
+     collected: list[str] = []
+     used = 0
+     for msg in reversed(turns):
+-        if msg.get("role") != "user":
++        if msg.get("role") != "user" or is_internal_context_message(msg):
+             continue
+         content = _content_text_for_contains(msg.get("content"))
+         if _synthetic_user_row(content):
+@@ -4336,7 +4337,8 @@ Write only the summary body. Do not include any preamble or prefix."""
+         """Recognize internal user-role rows by content marker (SessionDB drops metadata)."""
+         if not isinstance(message, dict) or message.get("role") != "user":
+             return False
+-        if cls._is_context_summary_message(message):
++        from agent.message_metadata import is_internal_context_message
++        if is_internal_context_message(message) or cls._is_context_summary_message(message):
+             return True
+         text = _content_text_for_contains(message.get("content")).strip()
+         # Recovery nudges are scaffolding, not human turns; lazy import avoids an import cycle.
+diff --git a/agent/message_metadata.py b/agent/message_metadata.py
+index 5a1669d594f..7510937f9d1 100644
+--- a/agent/message_metadata.py
++++ b/agent/message_metadata.py
+@@ -63,6 +63,19 @@ def without_persistence_fields(msg: Mapping[str, Any]) -> Mapping[str, Any]:
+     return {k: v for k, v in msg.items() if k not in PERSISTENCE_ONLY_MESSAGE_FIELDS}
+ 
+ 
++def is_internal_context_message(message: Any) -> bool:
++    """Reconoce una fila user interna por procedencia durable, nunca por su prosa."""
++    if not isinstance(message, dict) or message.get("role") != "user":
++        return False
++    metadata = message.get("display_metadata")
++    return (
++        message.get("display_kind") in ("internal_context", "hidden")
++        and isinstance(metadata, dict)
++        and isinstance(metadata.get("context_source"), str)
++        and bool(metadata["context_source"].strip())
++    )
++
++
+ def mint_uid() -> str:
+     """A fresh durable id (message or tool-call occurrence): random, never derived from content."""
+     return uuid4().hex
+diff --git a/agent/micro_compaction.py b/agent/micro_compaction.py
+index 42cad0c2d82..3cfa80709f9 100644
+--- a/agent/micro_compaction.py
++++ b/agent/micro_compaction.py
+@@ -492,10 +492,12 @@ class MicroCompactionMixin:
+         ``repair_message_sequence`` pass 2, done here so the marker and cursor are never collateral
+         damage of the downstream repair. Lists untouched."""
+         from agent.turn_context import drop_stale_api_content
++        from agent.message_metadata import is_internal_context_message
+ 
+         def _plain_user(m: Any) -> bool:
+             return (
+                 isinstance(m, dict) and m.get("role") == "user" and not _is_summary_marker(m)
++                and not is_internal_context_message(m)
+                 and isinstance(m.get("content"), str)
+             )
+ 
+diff --git a/agent/turn_request_assembly.py b/agent/turn_request_assembly.py
+index be7436e72fc..167e5919a5b 100644
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -180,9 +180,17 @@ def assemble_api_request(
+     # provider, #67321) the synthetic continuation nudge is Codex-only control text: drop it
+     # alongside the opaque replay state.
+     _cross_protocol = agent.api_mode != "codex_responses"
++    from agent.message_metadata import is_internal_context_message
++    # La metadata local ya fue retirada del wire. Mantener las fronteras internas
++    # con los bytes exactos del contexto canónico, sin campos extra para el provider.
++    internal_context_contents = frozenset(
++        text for message in messages if is_internal_context_message(message)
++        for text in (message.get("api_content"), message.get("content")) if isinstance(text, str)
++    )
+     api_messages = agent._drop_thinking_only_and_merge_users(
+         api_messages, drop_codex_reasoning_items=_cross_protocol,
+         drop_nudge_marker=_CODEX_INCOMPLETE_NUDGE if _cross_protocol else None,
++        **({"internal_context_contents": internal_context_contents} if internal_context_contents else {}),
+     )
+ 
+     # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
+diff --git a/tests/agent/test_internal_context_boundary.py b/tests/agent/test_internal_context_boundary.py
+new file mode 100644
+index 0000000..f982181
+--- /dev/null
++++ b/tests/agent/test_internal_context_boundary.py
++"""El contexto interno conserva su fila sin convertirse en palabras del usuario."""
++from copy import deepcopy
++from types import SimpleNamespace
++import logging
++import time
++
++from agent.agent_runtime_helpers import (
++    repair_message_sequence, drop_thinking_only_and_merge_users, sanitize_api_messages,
++)
++from agent.context_compressor import ContextCompressor, _build_verbatim_user_section
++from agent.message_metadata import is_internal_context_message
++
++
++def context_row():
++    return {'role': 'user', 'content': 'Referencia histórica interna',
++            'display_kind': 'internal_context',
++            'display_metadata': {'context_source': 'tests/tool-thread'}}
++
++
++def test_durable_provenance_not_content():
++    row = context_row()
++    assert is_internal_context_message(row)
++    for bad in ({'role': 'user', 'content': row['content']},
++                {**row, 'display_metadata': {}}, {**row, 'display_metadata': []},
++                {**row, 'role': 'assistant'}):
++        assert not is_internal_context_message(bad)
++
++
++def test_repair_preserves_both_sides_and_memory_sidecar():
++    rows = [{'role': 'user', 'content': 'Pregunta', 'api_content': 'Pregunta + memoria'},
++            context_row(), {'role': 'user', 'content': 'Continuación'}]
++    before = deepcopy(rows)
++    assert repair_message_sequence(None, rows) == 0
++    assert rows == before
++    compressor = ContextCompressor('offline', config_context_length=100000)
++    assert compressor._merge_adjacent_user_turns(rows) == before
++
++
++def test_context_is_not_human_quote():
++    row = context_row()
++    assert ContextCompressor._is_synthetic_compression_user_turn(row)
++    assert _build_verbatim_user_section([row]) == ''
++    assert 'Pregunta' in _build_verbatim_user_section([row, {'role': 'user', 'content': 'Pregunta'}])
++
++
++def test_send_merge_preserves_explicit_boundary():
++    rows = [{'role': 'user', 'content': 'Pregunta + memoria'},
++            {'role': 'user', 'content': context_row()['content']},
++            {'role': 'assistant', 'content': 'Respuesta'}]
++    before = deepcopy(rows)
++    out = drop_thinking_only_and_merge_users(
++        rows, internal_context_contents=frozenset({rows[1]['content']}))
++    assert out == before and rows == before
++    # El comportamiento previo sigue intacto cuando no hay procedencia interna.
++    assert len(drop_thinking_only_and_merge_users(rows)) == 2
++
++
++def test_full_request_assembly_keeps_separate_user_context(monkeypatch):
++    from agent.turn_request_assembly import assemble_api_request
++    from agent.message_sanitization import ReasoningReplayRoute
++    import agent.conversation_loop as loop
++
++    agent = SimpleNamespace(
++        _current_turn_timestamp=time.time(), ephemeral_system_prompt='',
++        _copy_reasoning_content_for_api=lambda *args: None,
++        _should_sanitize_tool_calls=lambda: False, prefill_messages=[],
++        _sanitize_api_messages=sanitize_api_messages,
++        _drop_thinking_only_and_merge_users=drop_thinking_only_and_merge_users,
++        api_mode='chat_completions', provider='custom', model='offline', base_url='http://localhost/v1',
++        tools=[], _use_prompt_caching=False, _usage_anchor=None,
++        context_compressor=SimpleNamespace(),
++        _reasoning_replay_route=lambda: ReasoningReplayRoute(False, None),
++        _needs_thinking_reasoning_pad=lambda: False,
++    )
++    monkeypatch.setattr(loop, '_apply_context_engine_selection', lambda agent, api, *args, **kwargs: api)
++    monkeypatch.setattr(loop, '_pressure_with_real_floor', lambda compressor, value: value)
++    monkeypatch.setattr(loop, '_midturn_request_pressure_tokens', lambda agent, messages, system, approx: approx)
++    rows = [{'role': 'user', 'content': 'Pregunta', 'api_content': 'Pregunta\n<memory-context>memoria</memory-context>'},
++            context_row(), {'role': 'assistant', 'content': 'Respuesta'},
++            {'role': 'user', 'content': 'Siguiente'}]
++    before = deepcopy(rows)
++    request = assemble_api_request(
++        agent, messages=rows, current_turn_user_idx=3, _ext_prefetch_cache='', _plugin_user_context='',
++        moa_config=None, active_system_prompt='', original_user_message='Siguiente',
++        pending_moa_prepared_request=None, request_logger=logging.getLogger('test'),
++    )
++    assert [m['role'] for m in request.api_messages] == ['user', 'user', 'assistant', 'user']
++    assert request.api_messages[0]['content'] == before[0]['api_content']
++    assert request.api_messages[1]['content'] == rows[1]['content']
++    assert request.api_messages[2]['content'] == 'Respuesta'
++    assert all(not any(k in m for k in ('display_kind', 'display_metadata')) for m in request.api_messages)
++    assert rows == before

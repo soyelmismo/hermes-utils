@@ -215,7 +215,7 @@ def check_tool_context_identity_and_isolation():
     r = rows()
     out = engine()._micro_compact(r)
     assert out[0] is r[0] and out[-1] is r[-1]
-    assert out[1]['role'] == 'assistant' and out[1]['api_content'].startswith('<tool-work-context>\n')
+    assert out[1]['role'] == 'user' and out[1]['api_content'].startswith('<tool-work-context>\n')
     assert out[1]['content'] == out[1]['api_content']
 
 
@@ -314,7 +314,7 @@ def check_finalizer_integration():
         assert len(loaded) == 3
         assert loaded[0]['content'] == before[0]['content']
         assert loaded[-1]['content'] == before[-1]['content']
-        assert loaded[1]['role'] == 'assistant'
+        assert loaded[1]['role'] == 'user'
         block = loaded[1]['content']
         assert block.startswith('<tool-work-context>\n')
         assert '<memory-context>' not in block

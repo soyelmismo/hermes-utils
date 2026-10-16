@@ -34,8 +34,18 @@ def main() -> int:
         [py_bin, "-c", "import hermes_bootstrap, runpy; runpy.run_path('verify_single_pass.py', run_name='__main__')"],
         cwd=HERE, env=env,
     ).returncode
-    if r1 != 0 or r2 != 0 or r3 != 0:
-        print(f"\nTests failed: segmented_micro_compact={r1}, tool_thread={r2}, single_pass={r3}")
+    print("\n=== Running verify_user_context.py ===")
+    r4 = subprocess.run(
+        [py_bin, "-c", "import hermes_bootstrap, runpy; runpy.run_path('verify_user_context.py', run_name='__main__')"],
+        cwd=HERE, env=env,
+    ).returncode
+    print("\n=== Running verify_skill_retention.py ===")
+    r5 = subprocess.run(
+        [py_bin, "-c", "import hermes_bootstrap, runpy; runpy.run_path('verify_skill_retention.py', run_name='__main__')"],
+        cwd=HERE, env=env,
+    ).returncode
+    if r1 != 0 or r2 != 0 or r3 != 0 or r4 != 0 or r5 != 0:
+        print(f"\nTests failed: segmented_micro_compact={r1}, tool_thread={r2}, single_pass={r3}, user_context={r4}, skill_retention={r5}")
         return 1
     print("\nAll plugin test suites passed successfully!")
     return 0
