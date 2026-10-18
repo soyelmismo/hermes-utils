@@ -21,7 +21,24 @@ ln -sf /path/to/hermes-utils/plugins/image_gen/horde ~/.hermes/plugins/image_gen
 plugins:
   enabled:
     - image_gen/horde
+  entries:
+    image_gen/horde:
+      allow_tool_override: true
+      allow_gateway_injection: true
+    horde:
+      allow_tool_override: true
 ```
+
+> **⚠️ Important: Built-in Tool Override Grant**
+> 
+> Hermes protects built-in tools (`image_generate` and `image_status`) from being shadowed by third-party plugins. Without operator authorization, Hermes will silently reject the registration with:
+> `Tool deregistration REJECTED: plugin 'hermes_plugins.image_gen__horde' attempted to remove tool 'image_generate' ... without operator opt-in.`
+> 
+> You **must** set `allow_tool_override: true` under `plugins.entries.image_gen/horde` (and `plugins.entries.horde`). You can also set it via CLI:
+> ```bash
+> hermes config set plugins.entries.image_gen/horde.allow_tool_override true
+> hermes config set plugins.entries.horde.allow_tool_override true
+> ```
 
 **Optional:** Set your Horde API key. The plugin checks in this order:
 
