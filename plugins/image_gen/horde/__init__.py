@@ -520,6 +520,11 @@ def _is_valid_image_bytes(data: Optional[bytes]) -> bool:
     """
     if not data or len(data) < MIN_IMAGE_BYTES:
         return False
+    is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpg = data.startswith(b"\xff\xd8\xff")
+    is_webp = data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"
+    if not (is_png or is_jpg or is_webp):
+        return False
     try:
         import io
         from PIL import Image, ImageStat
@@ -534,6 +539,9 @@ def _is_valid_image_bytes(data: Optional[bytes]) -> bool:
             # stddev across channels: a flat/solid image has ~0 stddev
             if max(stat.stddev) < 5.0:
                 return False
+        return True
+    except ImportError:
+        # PIL/Pillow not installed in current Python runtime; valid magic header + length is sufficient
         return True
     except Exception:
         return False
@@ -1817,6 +1825,7 @@ def register(ctx) -> None:
         handler=_handle_custom_generate,
         emoji="🎨",
         description=CUSTOM_TOOL_SCHEMA["description"],
+        override=True,
     )
     logger.info("Custom image_generate tool registered")
 
