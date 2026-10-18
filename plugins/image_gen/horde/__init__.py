@@ -1253,8 +1253,8 @@ async def _execute_lifecycle(
 
     # 5. Save to cache
     try:
-        from agent.image_gen_provider import _images_cache_dir
-        cache_dir = _images_cache_dir()
+        from hermes_constants import get_hermes_dir
+        cache_dir = get_hermes_dir("cache/images", "image_cache")
         ts = time.strftime("%Y%m%d_%H%M%S")
         short = uuid.uuid4().hex[:8]
         seed_used = first_gen.get("seed", "?")
