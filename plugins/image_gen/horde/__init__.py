@@ -389,7 +389,8 @@ async def _horde_generate(
 
     headers = {
         "apikey": api_key,
-        "Client-Agent": "HermesAgent:HordePlugin:v1.0.0:hermeona",
+        "Client-Agent": "cli_request:1.0:unknown",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/json",
     }
 
@@ -431,7 +432,8 @@ def _horde_submit_sync(
 
     headers = {
         "apikey": api_key,
-        "Client-Agent": "HermesAgent:HordePlugin:v1.0.0:hermeona",
+        "Client-Agent": "cli_request:1.0:unknown",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/json",
     }
     data = json.dumps(payload).encode("utf-8")
@@ -462,7 +464,11 @@ def _horde_submit_sync(
 
 async def _horde_check(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Check generation status."""
-    headers = {"apikey": api_key}
+    headers = {
+        "apikey": api_key,
+        "Client-Agent": "cli_request:1.0:unknown",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
     async with session.get(
         f"{HORDE_API_URL}/generate/check/{generation_id}",
         headers=headers,
@@ -475,7 +481,11 @@ async def _horde_check(session: Any, api_key: str, generation_id: str) -> Dict[s
 
 async def _horde_status(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Get generation results."""
-    headers = {"apikey": api_key}
+    headers = {
+        "apikey": api_key,
+        "Client-Agent": "cli_request:1.0:unknown",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
     async with session.get(
         f"{HORDE_API_URL}/generate/status/{generation_id}",
         headers=headers,
@@ -488,7 +498,11 @@ async def _horde_status(session: Any, api_key: str, generation_id: str) -> Dict[
 
 async def _horde_cancel(session: Any, api_key: str, generation_id: str) -> Dict[str, Any]:
     """Cancel a generation."""
-    headers = {"apikey": api_key}
+    headers = {
+        "apikey": api_key,
+        "Client-Agent": "cli_request:1.0:unknown",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
     async with session.delete(
         f"{HORDE_API_URL}/generate/status/{generation_id}",
         headers=headers,
