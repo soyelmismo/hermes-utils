@@ -14,6 +14,7 @@ try:
         TOOL_THREAD_END,
         sanitize_tool_context,
     )
+    from .compat_patch import apply_runtime_compat_patches
 except (ImportError, ValueError):
     from engine import SegmentedMicroCompactEngine
     from markers import (
@@ -25,6 +26,10 @@ except (ImportError, ValueError):
         TOOL_THREAD_END,
         sanitize_tool_context,
     )
+    from compat_patch import apply_runtime_compat_patches
+
+# Apply in-memory compatibility hooks on import so Hermes Agent core stays unmodified
+apply_runtime_compat_patches()
 
 __all__ = [
     "SegmentedMicroCompactEngine",
