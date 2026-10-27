@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 import logging
 
 from . import context as ctx
@@ -96,6 +97,61 @@ def _ensure_patch():
     ctx._patch_applied = True
     logger.info("Monkey-patch applied to _get_env_config + _resolve_container_task_id")
 
+def _resolve_core_run_job(fn):
+    """Return the real ``cron.scheduler.run_job``, unwrapping stale ssh-router wrappers.
+
+    A plugin reload re-runs ``register()`` while ``cs.run_job`` still points at the
+    previous wrapper. Capturing that as the "original" nests one wrapper inside the
+    next, and the stale inner signature then breaks every cron fire with TypeError.
+
+    Following ``__ssh_router_original__`` alone is not enough: wrappers installed
+    before that tag existed carry no attribute, and their closure is the only path
+    back to the core function. Walk the closure graph instead and stop at the
+    function that actually lives in ``cron.scheduler``.
+    """
+    stack = [fn]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if _is_core_run_job(cur):
+            return cur
+        for attr in ("__ssh_router_original__", "__wrapped__"):
+            nxt = getattr(cur, attr, None)
+            if nxt is not None and nxt is not cur:
+                stack.append(nxt)
+        for cell in getattr(cur, "__closure__", None) or ():
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if callable(val):
+                stack.append(val)
+    return fn
+
+
+def _is_core_run_job(fn) -> bool:
+    """True when ``fn`` is the scheduler's own ``run_job``, not an ssh-router wrapper."""
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return False
+    if not str(code.co_filename).replace("\\", "/").endswith("cron/scheduler.py"):
+        return False
+    if getattr(fn, "__name__", "") != "run_job":
+        return False
+    # Final guard: the real scheduler accepts the execution_id kwarg. Refusing to
+    # return a narrow function is what keeps the TypeError from ever coming back.
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "execution_id" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _patch_cron_scheduler():
     if ctx._cron_scheduler_patched:
         logger.debug("ssh-router: cron scheduler already patched — skipping")
@@ -109,8 +165,16 @@ def _patch_cron_scheduler():
     ctx._cron_scheduler_patched = True
 
     original_run_job = cs.run_job
+    # A plugin reload (control-socket `reload-plugins`) re-runs register() while
+    # cs.run_job still points at the PREVIOUS wrapper. Capturing that as the
+    # "original" nests a stale wrapper, and its narrow signature then breaks every
+    # cron fire with TypeError. Unwrap to the real core function instead.
+    original_run_job = _resolve_core_run_job(original_run_job)
 
-    def _patched_run_job(job):
+    def _patched_run_job(job, **kwargs):
+        # Forward every kwarg the core passes (execution_id, extra_prompt,
+        # cancel_event, defer_agent_teardown). A narrow (job) signature breaks
+        # every cron fire with TypeError once the scheduler grows a new kwarg.
         job_name = str(job.get("name") or job.get("prompt") or job.get("id", ""))
         device = None
         _cron_task_token = None
@@ -161,7 +225,7 @@ def _patch_cron_scheduler():
                 return False, doc, "", str(e)
 
         try:
-            return original_run_job(job)
+            return original_run_job(job, **kwargs)
         finally:
             if device:
                 if _cron_task_token is not None:
@@ -181,6 +245,8 @@ def _patch_cron_scheduler():
                     clear_ssh_env()
                 logger.info("Cron '%s': disconnected from '%s'", job_name, device)
 
+    # Tag the wrapper with the real core function so a later reload can unwrap.
+    setattr(_patched_run_job, "__ssh_router_original__", original_run_job)
     cs.run_job = _patched_run_job
     logger.info("Cron scheduler patched for auto-SSH routing via job name prefix")
 
