@@ -6,7 +6,8 @@ An account rotation and quota telemetry plugin for [Hermes Agent](https://github
 
 ## Features
 
-- 🔄 **Automatic Account Rotation**: When a Google Antigravity account hits its 5-hour rolling session limit or weekly limit (`RESOURCE_EXHAUSTED` / `429` / capacity error), Hermes's `transform_api_error_classification` hook queries the active backend, selects the best available account for the model pool, injects credentials into the local `agy` CLI environment, and retries the turn immediately.
+- 🔄 **Automatic Account Rotation**: When a Google Antigravity account hits its 5-hour rolling session limit or weekly limit (`RESOURCE_EXHAUSTED` / `429` / capacity error), or when Google rejects the account as not eligible (`Eligibility check failed`), Hermes's `transform_api_error_classification` hook queries the active backend, selects the best available account for the model pool, injects credentials into the local `agy` CLI environment, and retries the turn immediately.
+- ⏸ **Paused Accounts Honoured**: Accounts you pause in the OpenProxy panel (`active: false`) are excluded from rotation, from the exhausted fallback and from the quota-refresh recheck. The status table marks them `⏸ paused`. If every account is paused, rotation fails saying so instead of claiming no accounts exist.
 - 📊 **Quota Telemetry**: Tracks real-time 5-hour rolling session quotas, weekly quotas, and exact countdowns until quota reset across all registered accounts.
 - 🔀 **Hermes Agent Tools**: Exposes `antigravity_list_accounts`, `antigravity_switch_account`, and `antigravity_refresh_quotas` to the agent.
 - 💻 **CLI Management**: Includes `hermes antigravity [list|switch|refresh|rotate|login|remove]` subcommands for manual control.
