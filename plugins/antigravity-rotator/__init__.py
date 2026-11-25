@@ -22,7 +22,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 _AGY_PROVIDERS = {
     "antigravity",
@@ -45,6 +45,15 @@ _QUOTA_ERROR_PATTERNS = (
     "out of quota",
     "billing hard limit",
     "insufficient_quota",
+)
+
+# Account-ineligible error patterns (Google refuses the account, quota is fine)
+_INELIGIBLE_ERROR_PATTERNS = (
+    "eligibility check failed",
+    "not eligible for antigravity",
+    "verify your account",
+    "account is not eligible",
+    "account not eligible",
 )
 
 # Standalone 429 token pattern
@@ -71,6 +80,17 @@ def _is_quota_error(error_message: str | None, error: Exception | None = None) -
     if any(pat in full_text for pat in _QUOTA_ERROR_PATTERNS):
         return True
     return _QUOTA_STATUS_CODE_PATTERN.search(full_text) is not None
+
+
+def _is_account_ineligible_error(error_message: str | None, error: Exception | None = None) -> bool:
+    """Detect if an API error means Google rejected the account as not eligible."""
+    haystack = []
+    if error_message:
+        haystack.append(str(error_message).lower())
+    if error:
+        haystack.append(str(error).lower())
+    full_text = " ".join(haystack)
+    return any(pat in full_text for pat in _INELIGIBLE_ERROR_PATTERNS)
 
 
 def register(ctx: Any) -> None:
@@ -120,15 +140,23 @@ def register(ctx: Any) -> None:
             return None
 
         if status_code != 429 and not _is_quota_error(error_message, error):
-            return None
+            if not _is_account_ineligible_error(error_message, error):
+                return None
+            ineligible = True
+        else:
+            ineligible = False
 
         try:
             _, msg = rotator.rotate_to_next_account(model=model, quota_exhausted=True)
+            if ineligible:
+                message = f"Antigravity account not eligible. {msg}. Retrying turn..."
+            else:
+                message = f"Antigravity quota exhausted. {msg}. Retrying turn..."
             return {
                 "reason": "rate_limit",
                 "retryable": True,
                 "should_rotate_credential": True,
-                "message": f"Antigravity quota exhausted. {msg}. Retrying turn...",
+                "message": message,
             }
         except Exception as exc:
             logger.warning("[antigravity-rotator] Auto-rotation failed: %s", exc)

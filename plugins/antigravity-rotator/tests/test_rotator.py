@@ -62,6 +62,22 @@ def test_is_quota_error_individual_quota_message():
     )
 
 
+def test_is_account_ineligible_error():
+    # Real production message from agy on 25-nov: account rejected, quota fine
+    assert plugin_module._is_account_ineligible_error(
+        "Antigravity model error: Eligibility check failed: Your current account is not eligible "
+        "for Antigravity. Verify your account to continue."
+    )
+    assert plugin_module._is_account_ineligible_error(None, RuntimeError("eligibility check failed"))
+    assert not plugin_module._is_account_ineligible_error("RESOURCE_EXHAUSTED: quota limit reached")
+    assert not plugin_module._is_account_ineligible_error("malformed json request")
+    assert not plugin_module._is_account_ineligible_error(None, ValueError("invalid argument"))
+    # Eligibility failures must not be conflated with quota exhaustion
+    assert not plugin_module._is_quota_error(
+        "Antigravity model error: Eligibility check failed: Your current account is not eligible"
+    )
+
+
 def test_find_best_candidate():
     rotator = OpenProxyRotator(api_url="http://mock", token="mock")
     mock_accounts = [
@@ -532,3 +548,87 @@ def test_rotate_refresh_failure_proceeds_with_cached_data():
         best, _ = rotator.rotate_to_next_account(current_account_id=99)
         assert best["id"] == 1
         m_apply.assert_called_once_with(1)
+
+
+# ── Paused accounts (`active: false` in OpenProxy) never receive rotation ────
+
+def test_find_best_candidate_skips_paused_accounts():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [
+        _mk_account(1, sess_used=0, active=False),   # paused, freshest quota
+        _mk_account(2, sess_used=500, active=True),
+        _mk_account(3, sess_used=100),               # no active key → enabled
+    ]
+    with patch.object(rotator, "list_accounts", return_value=accounts):
+        candidates = [a["id"] for a in rotator.find_best_candidates(exclude_id=None)]
+    assert 1 not in candidates
+    assert set(candidates) == {2, 3}
+    assert candidates[0] == 3  # most remaining quota among enabled
+
+
+def test_rotate_skips_account_paused_after_refresh():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [_mk_account(1, sess_used=10), _mk_account(2, sess_used=500)]
+    with (
+        patch.object(rotator, "list_accounts", return_value=accounts),
+        patch.object(rotator, "refresh_quota") as m_refresh,
+        patch.object(rotator, "apply_account", return_value={"success": True}) as m_apply,
+    ):
+        # Cached data says account 1 is best; live refresh reveals it is paused
+        m_refresh.side_effect = lambda aid: {"active": False} if aid == 1 else {}
+        best, msg = rotator.rotate_to_next_account(current_account_id=99)
+        assert best["id"] == 2
+        m_apply.assert_called_once_with(2)
+        assert "[2]" in msg
+
+
+def test_all_paused_raises_exhausted_never_applies():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [_mk_account(1, sess_used=0, active=False), _mk_account(2, sess_used=0, active=False)]
+    with (
+        patch.object(rotator, "list_accounts", return_value=accounts),
+        patch.object(rotator, "apply_account") as m_apply,
+    ):
+        with pytest.raises(RuntimeError, match="are paused in OpenProxy"):
+            rotator.rotate_to_next_account(current_account_id=99)
+    m_apply.assert_not_called()
+
+
+def test_earliest_reset_fallback_ignores_paused():
+    rotator = OpenProxyRotator(api_url="http://mock", token="mock")
+    accounts = [
+        _mk_account(1, sess_used=1000, active=False, quota_session_reset_at="2026-09-22T04:00:00Z"),
+        _mk_account(2, sess_used=1000, quota_session_reset_at="2026-09-22T10:00:00Z"),
+    ]
+    with patch.object(rotator, "list_accounts", return_value=accounts):
+        best = rotator.find_best_candidate(allow_exhausted=True)
+    assert best is not None and best["id"] == 2
+
+
+def test_hook_triggers_rotation_on_ineligible_account():
+    ctx = MagicMock()
+    registered_hooks = {}
+
+    def mock_register_hook(name, cb):
+        registered_hooks[name] = cb
+
+    ctx.register_hook.side_effect = mock_register_hook
+    ctx.get_config.side_effect = lambda k, d=None: d
+
+    plugin_module.register(ctx)
+    hook_fn = registered_hooks["transform_api_error_classification"]
+
+    with patch("rotator.OpenProxyRotator.rotate_to_next_account") as mock_rotate:
+        mock_rotate.return_value = ({"id": 67, "email": "ok@gmail.com"}, "Rotated account to 67")
+        res = hook_fn(
+            provider="antigravity-subscription-directsdk",
+            error_message=(
+                "Antigravity model error: Eligibility check failed: Your current account is not "
+                "eligible for Antigravity. Verify your account to continue."
+            ),
+        )
+        assert res is not None
+        assert res["retryable"] is True
+        assert res["should_rotate_credential"] is True
+        assert "not eligible" in res["message"]
+        mock_rotate.assert_called_once()

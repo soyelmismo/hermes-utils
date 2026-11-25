@@ -51,6 +51,14 @@ _ISOLATED_TMP_ROOT = ISOLATED_TMP_ROOT
 _ISOLATED_HOME_GLOBS = ISOLATED_HOME_GLOBS
 
 
+def _is_enabled(account: dict[str, Any]) -> bool:
+    """False when OpenProxy reports the account as paused/disabled (`active: False`).
+
+    Missing key means enabled: the local file backend never sets it.
+    """
+    return bool(account.get("active", True))
+
+
 def format_remaining_time(iso_str: str | None) -> str:
     """Format an ISO 8601 timestamp as human-readable remaining time."""
     if not iso_str or iso_str == "N/A":
@@ -217,6 +225,8 @@ class OpenProxyRotator:
     def _earliest_reset_account(self, accounts: list[dict[str, Any]], pool_key: str = "gemini") -> dict[str, Any] | None:
         earliest_acc, earliest_ts = None, None
         for a in accounts:
+            if not _is_enabled(a):
+                continue
             pools = a.get("pools") or pools_from_openproxy(a)
             reset_at = pools.get(pool_key, {}).get("5h", {}).get("reset_at") or a.get("quota_session_reset_at")
             if reset_at and (earliest_ts is None or str(reset_at) < earliest_ts):
@@ -254,6 +264,8 @@ class OpenProxyRotator:
             if cid is not None and str(aid) == str(cid) and len(accounts) > 1:
                 continue
             if self._is_rate_limited(a):
+                continue
+            if not _is_enabled(a):
                 continue
 
             # Model support check (Point 6)
@@ -305,6 +317,8 @@ class OpenProxyRotator:
         else:
             pools = pools_from_openproxy(merged)
         merged["pools"] = pools
+        if not _is_enabled(merged):
+            return None
         if self._is_rate_limited(merged) or not is_usable_for_pool(pools, pool_key, self.quota_threshold_percent):
             return None
         return merged
@@ -351,6 +365,11 @@ class OpenProxyRotator:
     def _raise_no_usable_account(self, exclude_id: Any, pool_key: str = "gemini") -> NoReturn:
         fallback = self.find_best_candidate(exclude_id=exclude_id, allow_exhausted=True, pool_key=pool_key)
         if fallback is None:
+            accounts = self.list_accounts()
+            if accounts and not any(_is_enabled(a) for a in accounts):
+                raise RuntimeError(
+                    "All Antigravity accounts are paused in OpenProxy; enable one to continue."
+                )
             raise RuntimeError("No Antigravity accounts configured in OpenProxy.")
         pools = fallback.get("pools") or pools_from_openproxy(fallback)
         iso = (
@@ -377,6 +396,8 @@ class OpenProxyRotator:
             acc_id = a.get("id")
             act = "👉 **ACTIVE**" if str(acc_id) == str(aid) else ""
             lbl = a.get("email") or a.get("label") or "N/A"
+            if not _is_enabled(a):
+                lbl = f"⏸ paused · {lbl}"
             pools = a.get("pools") or pools_from_openproxy(a)
             pool = pools.get(pool_key, {})
             w5h = pool.get("5h", {})
